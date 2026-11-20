@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <errno.h>
+#include <ctype.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -78,6 +79,9 @@ struct h2_req {
     bool body_too_large;
     bool dispatched;
     bool responded;
+    bool http1;             /* HTTP/1.1 连接上的请求 */
+    bool http1_close;       /* 应答后关闭连接 */
+    bool write_failed;
     void *user_ctx;
     /* 响应 */
     h2_hdr_t *resp_hdrs;
@@ -149,6 +153,7 @@ const char *h2_req_path(const h2_req_t *req)      { return req->path ? req->path
 const char *h2_req_query(const h2_req_t *req)     { return req->query ? req->query : ""; }
 const char *h2_req_authority(const h2_req_t *req) { return req->authority ? req->authority : ""; }
 int32_t h2_req_stream_id(const h2_req_t *req)     { return req->stream_id; }
+const char *h2_req_proto(const h2_req_t *req)     { return req->http1 ? "http/1.1" : "h2"; }
 const char *h2_req_peer(const h2_req_t *req)      { return req->conn->peer; }
 void *h2_req_user_ctx(const h2_req_t *req)        { return req->user_ctx; }
 
@@ -195,8 +200,101 @@ esp_err_t h2_resp_add_header(h2_req_t *req, const char *name, const char *value)
             *p += 'a' - 'A';
         }
     }
-    h->next = req->resp_hdrs;
-    req->resp_hdrs = h;
+    /* 按添加顺序输出 */
+    h2_hdr_t **pp = &req->resp_hdrs;
+    while (*pp) {
+        pp = &(*pp)->next;
+    }
+    *pp = h;
+    return ESP_OK;
+}
+
+/* ---------- TLS 写 ---------- */
+
+static bool tls_write_all(h2_conn_t *c, const void *data, size_t length)
+{
+    const uint8_t *p = data;
+    size_t off = 0;
+    while (off < length) {
+        ssize_t n = esp_tls_conn_write(c->tls, p + off, length - off);
+        if (n == ESP_TLS_ERR_SSL_WANT_READ || n == ESP_TLS_ERR_SSL_WANT_WRITE) {
+            continue;
+        }
+        if (n <= 0) {
+            return false;
+        }
+        off += n;
+    }
+    return true;
+}
+
+/* ---------- HTTP/1.1 应答 ---------- */
+
+static const char *reason_phrase(int status)
+{
+    switch (status) {
+    case 200: return "OK";
+    case 201: return "Created";
+    case 204: return "No Content";
+    case 400: return "Bad Request";
+    case 404: return "Not Found";
+    case 405: return "Method Not Allowed";
+    case 408: return "Request Timeout";
+    case 413: return "Payload Too Large";
+    case 431: return "Request Header Fields Too Large";
+    case 500: return "Internal Server Error";
+    case 501: return "Not Implemented";
+    case 505: return "HTTP Version Not Supported";
+    default:  return "";
+    }
+}
+
+/* "x-checksum" -> "X-Checksum" */
+static size_t title_case(char *out, size_t cap, const char *name)
+{
+    size_t i = 0;
+    bool up = true;
+    for (; name[i] && i + 1 < cap; i++) {
+        char ch = name[i];
+        out[i] = up ? (char)toupper((unsigned char)ch) : ch;
+        up = ch == '-';
+    }
+    out[i] = '\0';
+    return i;
+}
+
+static esp_err_t http1_send(h2_req_t *req, int status, const char *content_type,
+                            const void *body, size_t len)
+{
+    size_t cap = 192 + (content_type ? strlen(content_type) : 0) + len;
+    for (h2_hdr_t *h = req->resp_hdrs; h; h = h->next) {
+        cap += strlen(h->name) + strlen(h->value) + 4;
+    }
+    char *buf = malloc(cap);
+    if (!buf) {
+        req->write_failed = true;
+        return ESP_ERR_NO_MEM;
+    }
+    size_t o = snprintf(buf, cap, "HTTP/1.1 %d %s\r\n", status, reason_phrase(status));
+    if (content_type) {
+        o += snprintf(buf + o, cap - o, "Content-Type: %s\r\n", content_type);
+    }
+    for (h2_hdr_t *h = req->resp_hdrs; h; h = h->next) {
+        o += title_case(buf + o, cap - o, h->name);
+        o += snprintf(buf + o, cap - o, ": %s\r\n", h->value);
+    }
+    o += snprintf(buf + o, cap - o, "Content-Length: %u\r\nServer: esp32-h2\r\n%s\r\n",
+                  (unsigned)len, req->http1_close ? "Connection: close\r\n" : "");
+    if (len) {
+        memcpy(buf + o, body, len);
+        o += len;
+    }
+    bool ok = tls_write_all(req->conn, buf, o);
+    free(buf);
+    if (!ok) {
+        req->write_failed = true;
+        return ESP_FAIL;
+    }
     return ESP_OK;
 }
 
@@ -224,6 +322,14 @@ esp_err_t h2_resp_send(h2_req_t *req, int status, const char *content_type,
         return ESP_ERR_INVALID_STATE;
     }
     req->responded = true;
+
+    if (req->http1) {
+        esp_err_t err = http1_send(req, status, content_type, body, len);
+        ESP_LOGI(TAG, "%s http/1.1 %s %s%s%s -> %d (%u B)", req->conn->peer, req->method,
+                 h2_req_path(req), req->query ? "?" : "", req->query ? req->query : "",
+                 status, (unsigned)len);
+        return err;
+    }
 
     if (len) {
         req->resp_body = malloc(len);
@@ -266,7 +372,7 @@ esp_err_t h2_resp_send(h2_req_t *req, int status, const char *content_type,
         ESP_LOGW(TAG, "submit_response 失败: %s", nghttp2_strerror(rv));
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "%s %s %s%s%s -> %d (%u B, stream %ld)", req->conn->peer, req->method,
+    ESP_LOGI(TAG, "%s h2 %s %s%s%s -> %d (%u B, stream %ld)", req->conn->peer, req->method,
              req->path, req->query ? "?" : "", req->query ? req->query : "",
              status, (unsigned)len, (long)req->stream_id);
     return ESP_OK;
@@ -278,7 +384,11 @@ static void dispatch(h2_conn_t *c, h2_req_t *req)
 {
     req->dispatched = true;
     if (!req->method[0] || !req->path) {
-        nghttp2_submit_rst_stream(c->ng, NGHTTP2_FLAG_NONE, req->stream_id, NGHTTP2_PROTOCOL_ERROR);
+        if (req->http1) {
+            h2_resp_sendstr(req, 400, "text/plain", "bad request\n");
+        } else {
+            nghttp2_submit_rst_stream(c->ng, NGHTTP2_FLAG_NONE, req->stream_id, NGHTTP2_PROTOCOL_ERROR);
+        }
         return;
     }
     if (req->body_too_large) {
@@ -321,19 +431,7 @@ static void dispatch(h2_conn_t *c, h2_req_t *req)
 static nghttp2_ssize send_cb(nghttp2_session *session, const uint8_t *data, size_t length,
                              int flags, void *user_data)
 {
-    h2_conn_t *c = user_data;
-    size_t off = 0;
-    while (off < length) {
-        ssize_t n = esp_tls_conn_write(c->tls, data + off, length - off);
-        if (n == ESP_TLS_ERR_SSL_WANT_READ || n == ESP_TLS_ERR_SSL_WANT_WRITE) {
-            continue;
-        }
-        if (n <= 0) {
-            return NGHTTP2_ERR_CALLBACK_FAILURE;
-        }
-        off += n;
-    }
-    return (nghttp2_ssize)length;
+    return tls_write_all(user_data, data, length) ? (nghttp2_ssize)length : NGHTTP2_ERR_CALLBACK_FAILURE;
 }
 
 static int on_begin_headers_cb(nghttp2_session *session, const nghttp2_frame *frame, void *user_data)
@@ -593,6 +691,224 @@ esp_err_t h2_server_set_cert(h2_server_handle_t srv, const uint8_t *cert_pem, si
     return ESP_OK;
 }
 
+/* ---------- HTTP/1.1 连接 ---------- */
+
+/* 读到数据返回字节数；空闲超时或连接关闭返回 <= 0 */
+static ssize_t http1_read(h2_conn_t *c, void *buf, size_t len, TickType_t *last_rx)
+{
+    const TickType_t idle = pdMS_TO_TICKS(c->srv->cfg.idle_timeout_ms);
+    for (;;) {
+        ssize_t n = esp_tls_conn_read(c->tls, buf, len);
+        if (n == ESP_TLS_ERR_SSL_WANT_READ || n == ESP_TLS_ERR_SSL_WANT_WRITE) {
+            if (c->srv->stopping || xTaskGetTickCount() - *last_rx > idle) {
+                return 0;
+            }
+            continue;
+        }
+        if (n > 0) {
+            *last_rx = xTaskGetTickCount();
+        }
+        return n;
+    }
+}
+
+static void http1_error(h2_req_t *req, int status, const char *msg)
+{
+    req->http1_close = true;
+    h2_resp_sendstr(req, status, "text/plain", msg);
+}
+
+static void serve_http1(h2_conn_t *c)
+{
+    h2_server_handle_t srv = c->srv;
+    const size_t cap = srv->cfg.max_header_bytes + 1024;   /* 请求行 + 请求头 */
+    char *buf = malloc(cap + 1);
+    if (!buf) {
+        return;
+    }
+    size_t have = 0;
+    TickType_t last_rx = xTaskGetTickCount();
+
+    for (;;) {
+        char *end = have >= 4 ? memmem(buf, have, "\r\n\r\n", 4) : NULL;
+        if (!end) {
+            if (have >= cap) {
+                h2_req_t tmp = { .conn = c, .http1 = true };
+                http1_error(&tmp, 431, "request header too large\n");
+                hdr_free_list(tmp.resp_hdrs);
+                break;
+            }
+            ssize_t n = http1_read(c, buf + have, cap - have, &last_rx);
+            if (n <= 0) {
+                if (n == 0 && have == 0) {
+                    ESP_LOGI(TAG, "%s 空闲超时", c->peer);
+                }
+                break;
+            }
+            have += n;
+            continue;
+        }
+
+        size_t head_len = end - buf + 4;
+        *end = '\0';
+        h2_req_t *req = calloc(1, sizeof(*req));
+        if (!req) {
+            break;
+        }
+        req->conn = c;
+        req->http1 = true;
+        bool keep = false;
+        long clen = 0;
+        int err_status = 0;
+        const char *err_msg = NULL;
+
+        /* 请求行：METHOD SP target SP HTTP/x.y */
+        char *line = buf, *next = strstr(line, "\r\n");
+        if (next) {
+            *next = '\0';
+            next += 2;
+        }
+        char *sp1 = strchr(line, ' ');
+        char *sp2 = sp1 ? strchr(sp1 + 1, ' ') : NULL;
+        if (!sp1 || !sp2 || sp1 == line || (size_t)(sp1 - line) >= sizeof(req->method) || sp2 == sp1 + 1) {
+            err_status = 400;
+            err_msg = "bad request line\n";
+        } else {
+            *sp1 = *sp2 = '\0';
+            strcpy(req->method, line);
+            const char *target = sp1 + 1, *ver = sp2 + 1;
+            if (strcmp(ver, "HTTP/1.1") == 0) {
+                keep = true;
+            } else if (strcmp(ver, "HTTP/1.0") != 0) {
+                err_status = 505;
+                err_msg = "unsupported HTTP version\n";
+            }
+            if (!err_status && target[0] != '/') {
+                err_status = 400;
+                err_msg = "request target must be an absolute path\n";
+            }
+            if (!err_status) {
+                req->path = strdup(target);
+                char *q = req->path ? strchr(req->path, '?') : NULL;
+                if (q) {
+                    *q = '\0';
+                    req->query = q + 1;
+                }
+            }
+        }
+
+        /* 请求头 */
+        for (line = next; !err_status && line && *line; line = next) {
+            next = strstr(line, "\r\n");
+            if (next) {
+                *next = '\0';
+                next += 2;
+            }
+            char *colon = strchr(line, ':');
+            if (!colon || colon == line) {
+                err_status = 400;
+                err_msg = "bad header line\n";
+                break;
+            }
+            *colon = '\0';
+            char *v = colon + 1;
+            while (*v == ' ' || *v == '\t') {
+                v++;
+            }
+            char *ve = v + strlen(v);
+            while (ve > v && (ve[-1] == ' ' || ve[-1] == '\t')) {
+                *--ve = '\0';
+            }
+            for (char *p = line; *p; p++) {
+                *p = (char)tolower((unsigned char)*p);
+            }
+            if (strcmp(line, "content-length") == 0) {
+                char *e;
+                clen = strtol(v, &e, 10);
+                if (e == v || *e || clen < 0) {
+                    err_status = 400;
+                    err_msg = "bad content-length\n";
+                }
+            } else if (strcmp(line, "transfer-encoding") == 0) {
+                err_status = 501;
+                err_msg = "transfer-encoding not supported, use content-length\n";
+            } else if (strcmp(line, "connection") == 0) {
+                if (strcasecmp(v, "close") == 0) {
+                    keep = false;
+                } else if (strcasecmp(v, "keep-alive") == 0) {
+                    keep = true;
+                }
+            } else if (strcmp(line, "host") == 0 && !req->authority) {
+                req->authority = strdup(v);
+            }
+            h2_hdr_t *h = hdr_new((uint8_t *)line, strlen(line), (uint8_t *)v, strlen(v));
+            if (h) {
+                h2_hdr_t **pp = &req->hdrs;
+                while (*pp) {
+                    pp = &(*pp)->next;
+                }
+                *pp = h;
+            }
+        }
+        req->hdr_bytes = head_len;
+        if (!err_status && head_len > srv->cfg.max_header_bytes) {
+            err_status = 431;
+            err_msg = "request header too large\n";
+        }
+
+        /* 请求体（Content-Length） */
+        size_t consumed = head_len;
+        bool io_failed = false;
+        if (!err_status && clen > 0) {
+            if ((size_t)clen > srv->cfg.max_body) {
+                req->body_too_large = true;     /* 不读取正文，回 413 后关闭连接 */
+                keep = false;
+            } else {
+                req->body = malloc(clen + 1);
+                if (!req->body) {
+                    io_failed = true;
+                } else {
+                    size_t avail = have - head_len;
+                    size_t got = avail < (size_t)clen ? avail : (size_t)clen;
+                    memcpy(req->body, buf + head_len, got);
+                    consumed += got;
+                    while (got < (size_t)clen) {
+                        ssize_t n = http1_read(c, req->body + got, clen - got, &last_rx);
+                        if (n <= 0) {
+                            io_failed = true;
+                            break;
+                        }
+                        got += n;
+                    }
+                    req->body[got] = '\0';
+                    req->body_len = got;
+                }
+            }
+        }
+        if (io_failed) {
+            req_free(req);
+            break;
+        }
+
+        req->http1_close = !keep;
+        if (err_status) {
+            http1_error(req, err_status, err_msg);
+            keep = false;
+        } else {
+            dispatch(c, req);
+        }
+        bool ok = !req->write_failed;
+        req_free(req);
+        if (!ok || !keep) {
+            break;
+        }
+        /* 保留已读到的下一个请求（流水线） */
+        memmove(buf, buf + consumed, have - consumed);
+        have -= consumed;
+    }
+    free(buf);
+}
+
 static void conn_task(void *arg)
 {
     h2_conn_t *c = arg;
@@ -623,19 +939,15 @@ static void conn_task(void *arg)
         goto done;
     }
 
+    /* ALPN 协商到 h2 走 HTTP/2；协商到 http/1.1 或未使用 ALPN 走 HTTP/1.1 */
     const char *alpn = mbedtls_ssl_get_alpn_protocol(esp_tls_get_ssl_context(c->tls));
-    if (!alpn || strcmp(alpn, "h2") != 0) {
-        static const char msg[] =
-            "HTTP/1.1 505 HTTP Version Not Supported\r\n"
-            "Content-Type: text/plain\r\nConnection: close\r\nContent-Length: 28\r\n\r\n"
-            "This server requires HTTP/2\n";
-        ESP_LOGI(TAG, "%s 未协商 h2（ALPN=%s），回 505", c->peer, alpn ? alpn : "无");
-        esp_tls_conn_write(c->tls, msg, sizeof(msg) - 1);
-        goto done;
+    if (alpn && strcmp(alpn, "h2") == 0) {
+        ESP_LOGI(TAG, "%s 已连接（h2）", c->peer);
+        serve_h2(c);
+    } else {
+        ESP_LOGI(TAG, "%s 已连接（http/1.1，ALPN=%s）", c->peer, alpn ? alpn : "无");
+        serve_http1(c);
     }
-
-    ESP_LOGI(TAG, "%s 已连接（h2）", c->peer);
-    serve_h2(c);
     ESP_LOGI(TAG, "%s 断开", c->peer);
 
 done:

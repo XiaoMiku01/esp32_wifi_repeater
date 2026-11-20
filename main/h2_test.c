@@ -1,5 +1,5 @@
 /*
- * HTTP/2 站点（端口 443，TLS）。域名、证书链、私钥由 h2_site 提供：
+ * HTTP/2 站点（端口 443，TLS，同时支持 HTTP/1.1）。域名、证书链、私钥由 h2_site 提供：
  * 默认为内嵌的 main/certs2/ 证书，可在配置页修改
  * 下游客户端经 DNS 中继把该域名解析到 192.168.4.1
  *   GET  /          说明页
@@ -36,8 +36,8 @@ static esp_err_t ping_get(h2_req_t *req)
 {
     char buf[200];
     snprintf(buf, sizeof(buf),
-             "{\"ok\":true,\"proto\":\"h2\",\"stream\":%ld,\"peer\":\"%s\",\"authority\":\"%s\",\"uptime_ms\":%lld}\n",
-             (long)h2_req_stream_id(req), h2_req_peer(req), h2_req_authority(req),
+             "{\"ok\":true,\"proto\":\"%s\",\"stream\":%ld,\"peer\":\"%s\",\"authority\":\"%s\",\"uptime_ms\":%lld}\n",
+             h2_req_proto(req), (long)h2_req_stream_id(req), h2_req_peer(req), h2_req_authority(req),
              esp_timer_get_time() / 1000);
     return h2_resp_sendstr(req, 200, "application/json", buf);
 }

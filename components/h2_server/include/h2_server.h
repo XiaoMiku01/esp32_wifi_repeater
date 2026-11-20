@@ -4,7 +4,8 @@
  * - 仅支持 TLS 上的 HTTP/2（h2），浏览器不支持明文 h2c
  * - 每个连接一个任务；请求收齐（END_STREAM）后同步调用处理函数
  * - 处理函数内调用 h2_resp_send() 一次性给出响应（状态码、头、正文）
- * - 未协商到 h2 的客户端（例如只会 HTTP/1.1）收到 505 后断开
+ * - ALPN 协商到 http/1.1 或未使用 ALPN 的客户端走 HTTP/1.1（支持持久连接、
+ *   Content-Length 请求体；不支持 chunked 请求体），路由与处理函数相同
  */
 #pragma once
 
@@ -86,7 +87,8 @@ const char *h2_req_method(const h2_req_t *req);
 const char *h2_req_path(const h2_req_t *req);    /* 不含查询串 */
 const char *h2_req_query(const h2_req_t *req);   /* '?' 之后部分，没有则为 "" */
 const char *h2_req_authority(const h2_req_t *req);
-int32_t h2_req_stream_id(const h2_req_t *req);
+int32_t h2_req_stream_id(const h2_req_t *req);  /* HTTP/1.1 请求为 0 */
+const char *h2_req_proto(const h2_req_t *req);  /* "h2" 或 "http/1.1" */
 const char *h2_req_peer(const h2_req_t *req);    /* 客户端 IP 字符串 */
 /* 按名查找请求头（不区分大小写），没有返回 NULL */
 const char *h2_req_header(const h2_req_t *req, const char *name);
