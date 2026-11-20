@@ -5,73 +5,113 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ESP32 Wi-Fi 中继</title>
 <style>
-  :root { --bg:#f4f5f7; --card:#fff; --fg:#1d1f23; --muted:#6b7280; --line:#e5e7eb;
-          --accent:#2563eb; --ok:#16a34a; --bad:#dc2626; --log-bg:#0f1115; --log-fg:#d1d5db; }
+  :root { --bg:#f4f5f7; --card:#fff; --fg:#1d1f23; --muted:#6b7280; --line:#e5e7eb; --hover:rgba(127,127,127,.08);
+          --accent:#2563eb; --accent-soft:rgba(37,99,235,.10); --ok:#16a34a; --bad:#dc2626; --warn:#d97706;
+          --log-bg:#0f1115; --log-fg:#d1d5db; --hdr:52px; --nav:200px; }
   @media (prefers-color-scheme: dark) {
-    :root { --bg:#111317; --card:#1a1d23; --fg:#e5e7eb; --muted:#9ca3af; --line:#2a2e36; }
+    :root { --bg:#111317; --card:#1a1d23; --fg:#e5e7eb; --muted:#9ca3af; --line:#2a2e36; --accent-soft:rgba(96,165,250,.15); }
   }
-  * { box-sizing: border-box; }
-  body { margin:0; font:14px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
-         background:var(--bg); color:var(--fg); }
-  header { padding:14px 20px; border-bottom:1px solid var(--line); background:var(--card);
-           display:flex; align-items:center; gap:12px; }
-  header h1 { font-size:16px; margin:0; }
-  .dot { width:10px; height:10px; border-radius:50%; background:var(--muted); display:inline-block; }
+  * { box-sizing:border-box; }
+  html, body { margin:0; }
+  body { font:14px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif; background:var(--bg); color:var(--fg);
+         -webkit-text-size-adjust:100%; }
+  a { color:var(--accent); }
+  code { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; background:var(--hover); padding:0 3px; border-radius:3px; }
+
+  /* 顶栏 */
+  header.top { position:sticky; top:0; z-index:20; height:var(--hdr); padding:0 16px; display:flex; align-items:center; gap:10px;
+               background:var(--card); border-bottom:1px solid var(--line); }
+  header.top h1 { font-size:16px; margin:0; white-space:nowrap; }
+  .pill { display:inline-flex; align-items:center; gap:6px; padding:2px 10px; border-radius:999px; border:1px solid var(--line);
+          font-size:12px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+  .spacer { flex:1; }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--muted); display:inline-block; flex:none; }
   .dot.ok { background:var(--ok); } .dot.bad { background:var(--bad); }
-  main { max-width:1100px; margin:0 auto; padding:16px; display:grid; gap:16px;
-         grid-template-columns: minmax(0,360px) minmax(0,1fr); }
-  main > * { min-width:0; }
-  @media (max-width: 820px) { main { grid-template-columns: 1fr; } }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; }
-  .card h2 { font-size:14px; margin:0 0 12px; }
-  .stat { display:grid; grid-template-columns: 90px 1fr; row-gap:4px; }
-  .stat span:nth-child(odd) { color:var(--muted); }
-  fieldset { border:1px solid var(--line); border-radius:6px; margin:0 0 12px; padding:10px 12px; min-width:0; }
+
+  /* 布局：桌面左侧导航，手机顶部横向标签 */
+  .layout { display:grid; grid-template-columns:var(--nav) minmax(0,1fr); max-width:1240px; margin:0 auto; }
+  nav.tabs { position:sticky; top:var(--hdr); align-self:start; height:calc(100vh - var(--hdr)); padding:14px 10px;
+             display:flex; flex-direction:column; gap:2px; border-right:1px solid var(--line); }
+  nav.tabs a { display:flex; align-items:center; gap:8px; padding:9px 12px; border-radius:6px; color:var(--fg);
+               text-decoration:none; white-space:nowrap; }
+  nav.tabs a:hover { background:var(--hover); }
+  nav.tabs a.active { background:var(--accent-soft); color:var(--accent); font-weight:600; }
+  nav.tabs a.ext { margin-top:auto; color:var(--muted); }
+  .badge { min-width:18px; padding:0 6px; border-radius:9px; background:var(--bad); color:#fff; font-size:11px;
+           line-height:18px; text-align:center; font-weight:600; }
+  .badge:empty { display:none; }
+  main { padding:16px; min-width:0; }
+  .panel { display:none; }
+  .panel.active { display:grid; gap:16px; grid-template-columns:repeat(auto-fit, minmax(min(100%, 380px), 1fr)); align-items:start; }
+  .panel-head { grid-column:1 / -1; display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
+  .panel-head h2 { font-size:18px; margin:0; }
+
+  @media (max-width: 760px) {
+    :root { --hdr:48px; }
+    header.top { padding:0 12px; }
+    header.top h1 { font-size:15px; }
+    .layout { display:block; }
+    nav.tabs { position:sticky; top:var(--hdr); z-index:15; height:auto; flex-direction:row; overflow-x:auto;
+               padding:6px 8px; gap:4px; border-right:none; border-bottom:1px solid var(--line); background:var(--card);
+               scrollbar-width:none; }
+    nav.tabs::-webkit-scrollbar { display:none; }
+    nav.tabs a { padding:7px 12px; flex:none; }
+    nav.tabs a.ext { margin-top:0; }
+    main { padding:10px; }
+    .panel.active { gap:10px; }
+    .hide-sm { display:none; }
+  }
+
+  /* 卡片与表单 */
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; min-width:0; }
+  .card h3 { font-size:14px; margin:0 0 12px; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .card.wide { grid-column:1 / -1; }
+  .stat { display:grid; grid-template-columns:auto 1fr; gap:4px 14px; }
+  .stat span:nth-child(odd) { color:var(--muted); white-space:nowrap; }
+  .tiles { display:grid; grid-template-columns:repeat(auto-fit, minmax(140px, 1fr)); gap:10px; }
+  .tile { border:1px solid var(--line); border-radius:8px; padding:10px 12px; min-width:0; }
+  .tile .k { color:var(--muted); font-size:12px; }
+  .tile .v { font-size:16px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  fieldset { border:1px solid var(--line); border-radius:8px; margin:0; padding:12px 14px; min-width:0; }
   legend { padding:0 4px; color:var(--muted); }
-  label { display:block; margin:6px 0 2px; }
-  input[type=text], input[type=password], input[type=number] {
-    width:100%; padding:6px 8px; border:1px solid var(--line); border-radius:4px;
+  .fieldsets { display:grid; gap:12px; grid-template-columns:repeat(auto-fit, minmax(min(100%, 300px), 1fr)); margin-bottom:12px; }
+  label { display:block; margin:8px 0 3px; }
+  input[type=text], input[type=password], input[type=number], textarea {
+    width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:6px;
     background:var(--bg); color:var(--fg); font:inherit; }
-  .check { display:flex; align-items:center; gap:6px; margin-top:6px; color:var(--muted); }
+  input:focus, textarea:focus { outline:2px solid var(--accent-soft); border-color:var(--accent); }
+  textarea { min-height:140px; font:12px/1.45 ui-monospace,Menlo,Consolas,monospace; resize:vertical; }
+  .pem { min-height:96px; }
+  .check { display:flex; align-items:center; gap:6px; margin-top:8px; color:var(--muted); }
   .check input { margin:0; }
-  button { padding:7px 14px; border:1px solid var(--line); border-radius:4px; background:var(--card);
+  button { padding:8px 14px; border:1px solid var(--line); border-radius:6px; background:var(--card);
            color:var(--fg); font:inherit; cursor:pointer; }
+  button:hover { background:var(--hover); }
   button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.danger { color:var(--bad); border-color:var(--bad); }
   button:disabled { opacity:.6; cursor:default; }
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-  #msg { margin-top:8px; min-height:1.5em; }
-  #msg.ok { color:var(--ok); } #msg.bad { color:var(--bad); }
-  .log-card { display:flex; flex-direction:column; min-height:520px; }
-  .log-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }
-  .log-head h2 { margin:0; }
-  #log { flex:1; margin:0; padding:10px; overflow:auto; background:var(--log-bg); color:var(--log-fg);
-         border-radius:6px; font:12px/1.45 ui-monospace,Menlo,Consolas,monospace;
-         white-space:pre-wrap; word-break:break-all; height:0; min-height:460px; }
-  #log .E { color:#f87171; } #log .W { color:#fbbf24; } #log .I { color:#86efac; }
-  /* 命中自定义接口的日志行 */
-  #log .hit { background:rgba(250,204,21,.18); color:#fde047; box-shadow:inset 3px 0 0 #facc15;
-              padding-left:6px; font-weight:600; }
-  #toasts { position:fixed; top:12px; right:12px; z-index:1000; display:flex; flex-direction:column;
-            gap:8px; width:min(360px, calc(100vw - 24px)); }
-  .toast { background:#1f2937; color:#f9fafb; border-left:4px solid #facc15; border-radius:6px;
-           padding:8px 12px; box-shadow:0 6px 18px rgba(0,0,0,.35); cursor:pointer;
-           animation:toast-in .2s ease-out; }
-  .toast .t { font-weight:600; color:#fde047; }
-  .toast .s { color:#d1d5db; font-size:12px; word-break:break-all; margin-top:2px; }
-  @keyframes toast-in { from { opacity:0; transform:translateY(-6px); } to { opacity:1; transform:none; } }
-  @keyframes hit-flash { from { background:rgba(250,204,21,.5); } to { background:transparent; } }
-  #log .D, #log .V { color:#9ca3af; }
   .muted { color:var(--muted); font-size:12px; }
+  .hint { color:var(--muted); font-size:12px; margin:8px 0 0; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); } .warn { color:var(--warn); }
+  #msg, #ovMsg, #rtMsg, #dnsMsg, #siteMsg, #dfMsg, #bkMsg { margin-top:8px; min-height:1.2em; }
+  @media (max-width: 760px) {
+    .card { padding:12px; border-radius:8px; }
+    input[type=text], input[type=password], input[type=number], textarea { font-size:16px; }  /* 避免 iOS 聚焦放大 */
+    textarea { font-size:13px; }
+    button { padding:9px 14px; }
+  }
+
+  /* 扫描列表 */
   .ssid-row { display:flex; gap:6px; }
   .ssid-row input { flex:1; min-width:0; width:auto; }
-  .ssid-row button { padding:6px 10px; white-space:nowrap; }
-  #scanList { list-style:none; margin:6px 0 0; padding:0; max-height:220px; overflow:auto;
-              border:1px solid var(--line); border-radius:4px; }
+  .ssid-row button { white-space:nowrap; }
+  #scanList { list-style:none; margin:6px 0 0; padding:0; max-height:240px; overflow:auto;
+              border:1px solid var(--line); border-radius:6px; }
   #scanList:empty { display:none; }
-  #scanList li { display:flex; align-items:center; gap:8px; padding:6px 8px; cursor:pointer;
-                 border-bottom:1px solid var(--line); }
+  #scanList li { display:flex; align-items:center; gap:8px; padding:8px 10px; cursor:pointer; border-bottom:1px solid var(--line); }
   #scanList li:last-child { border-bottom:none; }
-  #scanList li:hover, #scanList li.sel { background:var(--bg); }
+  #scanList li:hover, #scanList li.sel { background:var(--hover); }
   #scanList .name { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   #scanList .meta { color:var(--muted); font-size:12px; white-space:nowrap; }
   .bars { display:inline-flex; align-items:flex-end; gap:2px; height:14px; }
@@ -79,75 +119,128 @@
   .bars i.on { background:var(--accent); }
   .bars i:nth-child(1){height:25%} .bars i:nth-child(2){height:50%}
   .bars i:nth-child(3){height:75%} .bars i:nth-child(4){height:100%}
-  textarea { width:100%; min-height:140px; padding:6px 8px; border:1px solid var(--line); border-radius:4px;
-             background:var(--bg); color:var(--fg); font:12px/1.45 ui-monospace,Menlo,Consolas,monospace;
-             resize:vertical; }
-  .prefix-row { display:flex; align-items:center; border:1px solid var(--line); border-radius:4px;
-                background:var(--bg); }
-  .prefix-row span { padding:0 0 0 8px; color:var(--muted); white-space:nowrap; font-size:12px; }
+
+  /* 列表（自定义接口 / DNS 解析） */
+  .prefix-row { display:flex; align-items:center; border:1px solid var(--line); border-radius:6px; background:var(--bg); }
+  .prefix-row span { padding:0 0 0 10px; color:var(--muted); white-space:nowrap; font-size:12px;
+                     max-width:45%; overflow:hidden; text-overflow:ellipsis; }
   .prefix-row input { border:none; background:transparent; min-width:0; flex:1; }
-  #rtList { list-style:none; margin:0 0 10px; padding:0; border:1px solid var(--line); border-radius:4px; }
-  #rtList:empty { display:none; }
-  #rtList li { display:flex; align-items:center; gap:8px; padding:6px 8px; border-bottom:1px solid var(--line); }
-  #rtList li:last-child { border-bottom:none; }
-  #rtList .p { font-family:ui-monospace,Menlo,Consolas,monospace; overflow:hidden; text-overflow:ellipsis;
-               white-space:nowrap; }
-  #rtList .j { flex:1; min-width:0; color:var(--muted); font-size:12px; overflow:hidden;
-               text-overflow:ellipsis; white-space:nowrap; font-family:ui-monospace,Menlo,Consolas,monospace; }
-  #rtList button { padding:3px 8px; font-size:12px; }
+  #rtList, #dnsList { list-style:none; margin:0 0 10px; padding:0; border:1px solid var(--line); border-radius:6px; }
+  #rtList:empty, #dnsList:empty { display:none; }
+  #rtList li, #dnsList li { display:flex; align-items:center; gap:8px; padding:8px 10px; border-bottom:1px solid var(--line);
+                            flex-wrap:wrap; }
+  #rtList li:last-child, #dnsList li:last-child { border-bottom:none; }
+  #rtList .p, #dnsList .n { font-family:ui-monospace,Menlo,Consolas,monospace; overflow:hidden; text-overflow:ellipsis;
+                            white-space:nowrap; min-width:0; }
+  #dnsList .n { flex:1; }
+  #rtList .j { flex:1; min-width:120px; color:var(--muted); font-size:12px; overflow:hidden; text-overflow:ellipsis;
+               white-space:nowrap; font-family:ui-monospace,Menlo,Consolas,monospace; }
+  #dnsList .i { color:var(--muted); font-size:12px; white-space:nowrap; font-family:ui-monospace,Menlo,Consolas,monospace; }
+  #rtList button, #dnsList button { padding:3px 10px; font-size:12px; }
   #rtList li.flash { animation:hit-flash 2s ease-out; }
-  #rtList .cnt { font-size:11px; padding:0 6px; border-radius:8px; background:#facc15; color:#111;
-                 white-space:nowrap; }
+  #rtList .cnt { font-size:11px; padding:0 6px; border-radius:8px; background:#facc15; color:#111; white-space:nowrap; }
   #rtList .cnt:empty { display:none; }
-  #rtMsg.ok, #dnsMsg.ok, #siteMsg.ok, #dfMsg.ok { color:var(--ok); }
-  #rtMsg.bad, #dnsMsg.bad, #siteMsg.bad, #dfMsg.bad { color:var(--bad); }
-  #siteMsg.warn { color:#d97706; }
-  #bkMsg.ok { color:var(--ok); } #bkMsg.bad { color:var(--bad); }
+  @keyframes hit-flash { from { background:rgba(250,204,21,.5); } to { background:transparent; } }
+  #siteMsg.warn { color:var(--warn); }
   #bkLog { margin:6px 0 0; padding-left:18px; font-size:12px; color:var(--muted); }
   #bkLog:empty { display:none; }
-  .pem { min-height:90px; }
-  .file-row { display:flex; justify-content:space-between; align-items:center; margin:6px 0 2px; }
+  .file-row { display:flex; justify-content:space-between; align-items:center; gap:8px; margin:8px 0 3px; flex-wrap:wrap; }
   .file-row label { margin:0; }
-  .file-row input[type=file] { font-size:12px; max-width:60%; }
+  .file-row input[type=file] { font-size:12px; max-width:100%; }
   .tag { display:inline-block; padding:0 6px; border-radius:3px; font-size:11px; border:1px solid var(--line); }
   .tag.ok { color:var(--ok); border-color:var(--ok); } .tag.bad { color:var(--bad); border-color:var(--bad); }
-  #dnsList { list-style:none; margin:0 0 10px; padding:0; border:1px solid var(--line); border-radius:4px; }
-  #dnsList:empty { display:none; }
-  #dnsList li { display:flex; align-items:center; gap:8px; padding:6px 8px; border-bottom:1px solid var(--line); }
-  #dnsList li:last-child { border-bottom:none; }
-  #dnsList .n { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
-                font-family:ui-monospace,Menlo,Consolas,monospace; }
-  #dnsList .i { color:var(--muted); font-size:12px; white-space:nowrap; font-family:ui-monospace,Menlo,Consolas,monospace; }
-  #dnsList button { padding:3px 8px; font-size:12px; }
+
+  /* 日志 */
+  .log-card { grid-column:1 / -1; display:flex; flex-direction:column; padding:0; overflow:hidden; }
+  .log-bar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding:10px 12px; border-bottom:1px solid var(--line); }
+  .log-bar input[type=text] { width:auto; flex:1; min-width:140px; padding:6px 10px; }
+  .lv { display:inline-flex; border:1px solid var(--line); border-radius:6px; overflow:hidden; }
+  .lv button { border:none; border-radius:0; padding:5px 10px; font-size:12px; font-weight:600; }
+  .lv button + button { border-left:1px solid var(--line); }
+  .lv button.on.E { background:rgba(248,113,113,.18); color:#ef4444; }
+  .lv button.on.W { background:rgba(251,191,36,.18); color:#d97706; }
+  .lv button.on.I { background:rgba(134,239,172,.20); color:#16a34a; }
+  .lv button.on.D { background:var(--hover); color:var(--muted); }
+  .lv button:not(.on) { color:var(--muted); text-decoration:line-through; opacity:.6; }
+  .log-bar .check { margin:0; }
+  .log-bar button.small { padding:5px 10px; font-size:12px; }
+  #log { margin:0; padding:8px 12px; overflow:auto; background:var(--log-bg); color:var(--log-fg);
+         font:12px/1.5 ui-monospace,Menlo,Consolas,monospace; white-space:pre-wrap; word-break:break-all;
+         height:calc(100vh - var(--hdr) - 150px); min-height:320px; }
+  #log .E { color:#f87171; } #log .W { color:#fbbf24; } #log .I { color:#86efac; } #log .D, #log .V { color:#9ca3af; }
+  #log .hit { background:rgba(250,204,21,.18); color:#fde047; box-shadow:inset 3px 0 0 #facc15; padding-left:6px; font-weight:600; }
+  #log mark { background:rgba(250,204,21,.45); color:inherit; border-radius:2px; }
+  .log-foot { display:flex; gap:12px; padding:6px 12px; font-size:12px; color:var(--muted); border-top:1px solid var(--line); }
+  @media (max-width: 760px) {
+    #log { height:calc(100vh - var(--hdr) - 48px - 190px); font-size:11.5px; padding:6px 8px; }
+    .log-bar { padding:8px; gap:6px; }
+  }
+
+  /* 命中提示 */
+  #toasts { position:fixed; top:calc(var(--hdr) + 8px); right:12px; z-index:1000; display:flex; flex-direction:column;
+            gap:8px; width:min(360px, calc(100vw - 24px)); }
+  .toast { background:#1f2937; color:#f9fafb; border-left:4px solid #facc15; border-radius:6px;
+           padding:8px 12px; box-shadow:0 6px 18px rgba(0,0,0,.35); cursor:pointer; animation:toast-in .2s ease-out; }
+  .toast .t { font-weight:600; color:#fde047; }
+  .toast .s { color:#d1d5db; font-size:12px; word-break:break-all; margin-top:2px; }
+  @keyframes toast-in { from { opacity:0; transform:translateY(-6px); } to { opacity:1; transform:none; } }
 </style>
 </head>
 <body>
-<header>
+<header class="top">
   <h1>ESP32 Wi-Fi 中继</h1>
-  <span class="dot" id="upDot"></span><span id="upText" class="muted">读取中…</span>
-  <a href="/monitor" style="margin-left:auto; color:var(--accent); text-decoration:none">记录页 →</a>
+  <span class="pill"><span class="dot" id="upDot"></span><span id="upText">读取中…</span></span>
+  <span class="spacer"></span>
+  <span class="pill hide-sm">日志 <span class="dot" id="wsDot"></span></span>
 </header>
 
-<main>
-  <div style="display:grid; grid-template-columns:minmax(0,1fr); gap:16px; align-content:start">
-    <section class="card">
-      <h2>运行状态</h2>
-      <div class="stat">
-        <span>上游</span><span id="sUp">-</span>
-        <span>STA IP</span><span id="sIp">-</span>
-        <span>网关</span><span id="sGw">-</span>
-        <span>信号</span><span id="sRssi">-</span>
-        <span>信道</span><span id="sCh">-</span>
-        <span>AP IP</span><span id="sAp">-</span>
-        <span>客户端</span><span id="sCli">-</span>
-        <span>运行时间</span><span id="sUp2">-</span>
-        <span>空闲内存</span><span id="sHeap">-</span>
+<div class="layout">
+  <nav class="tabs" id="tabs">
+    <a href="#overview" data-tab="overview">概览</a>
+    <a href="#wifi" data-tab="wifi">Wi-Fi</a>
+    <a href="#dns" data-tab="dns">DNS</a>
+    <a href="#site" data-tab="site">HTTPS 站点</a>
+    <a href="#log" data-tab="log">日志 <span class="badge" id="logBadge"></span></a>
+    <a href="#backup" data-tab="backup">备份</a>
+    <a href="/monitor" class="ext">记录页 ↗</a>
+  </nav>
+  <main>
+  <div class="panel" id="tab-overview">
+    <section class="card wide">
+      <h3>运行状态</h3>
+      <div class="tiles">
+        <div class="tile"><div class="k">上游</div><div class="v" id="sUp">-</div></div>
+        <div class="tile"><div class="k">STA IP</div><div class="v" id="sIp">-</div></div>
+        <div class="tile"><div class="k">网关</div><div class="v" id="sGw">-</div></div>
+        <div class="tile"><div class="k">信号</div><div class="v" id="sRssi">-</div></div>
+        <div class="tile"><div class="k">信道</div><div class="v" id="sCh">-</div></div>
+        <div class="tile"><div class="k">AP IP</div><div class="v" id="sAp">-</div></div>
+        <div class="tile"><div class="k">客户端</div><div class="v" id="sCli">-</div></div>
+        <div class="tile"><div class="k">运行时间</div><div class="v" id="sUp2">-</div></div>
+        <div class="tile"><div class="k">空闲内存</div><div class="v" id="sHeap">-</div></div>
       </div>
     </section>
-
     <section class="card">
-      <h2>配置</h2>
+      <h3>快捷入口</h3>
+      <div class="row">
+        <a href="#wifi"><button type="button">Wi-Fi 设置</button></a>
+        <a href="#log"><button type="button">查看日志</button></a>
+        <a href="/monitor"><button type="button">记录页</button></a>
+      </div>
+      <p class="hint">配置页：<code>http://192.168.4.1/</code>，仅连接本机热点或上游网络的设备可访问。</p>
+    </section>
+    <section class="card">
+      <h3>设备</h3>
+      <div class="row"><button type="button" class="danger" id="restartBtn">重启设备</button></div>
+      <div id="ovMsg"></div>
+    </section>
+  </div>
+
+  <div class="panel" id="tab-wifi">
+<section class="card wide">
+      <h3>上游与本机热点</h3>
       <form id="cfg" autocomplete="off">
+        <div class="fieldsets">
         <fieldset>
           <legend>上游路由器（STA）</legend>
           <label for="sta_ssid">SSID</label>
@@ -171,17 +264,61 @@
           <label for="ap_max_conn">最大客户端数（1-15）</label>
           <input type="number" id="ap_max_conn" name="ap_max_conn" min="1" max="15" required>
         </fieldset>
+        </div>
         <div class="row">
           <button type="submit" class="primary" id="saveBtn">保存并应用</button>
-          <button type="button" id="restartBtn">重启设备</button>
         </div>
         <div id="msg"></div>
         <p class="muted">修改本机热点后，已连接的设备会断开，需要用新 SSID/密码重新连接。</p>
       </form>
     </section>
+  </div>
 
-    <section class="card">
-      <h2>HTTP/2 站点</h2>
+  <div class="panel" id="tab-dns">
+<section class="card">
+      <h3>DNS 自定义解析 <span class="muted" id="dnsCount"></span></h3>
+      <p class="muted">列表中的域名由本机直接应答；未配置的域名照常转发到上游 DNS。仅对连接本机热点的设备生效。</p>
+      <ul id="dnsList"></ul>
+      <form id="dnsForm" autocomplete="off">
+        <label for="dnsName">域名</label>
+        <input type="text" id="dnsName" maxlength="63" placeholder="www.example.com" required>
+        <label for="dnsIp">IPv4 地址</label>
+        <input type="text" id="dnsIp" maxlength="15" placeholder="留空 = 本机 AP 地址">
+        <div class="row" style="margin-top:8px">
+          <button type="submit" class="primary">保存解析</button>
+          <button type="button" id="dnsNew">清空</button>
+        </div>
+        <div id="dnsMsg"></div>
+      </form>
+    </section>
+<section class="card">
+      <h3>DNS 黑名单 <span class="muted" id="dfCount"></span></h3>
+      <p class="muted">被拦截的域名回 NXDOMAIN（域名不存在）。每行一条，# 开头为注释。<br>
+        黑名单：不含通配符时精确匹配；<code>*</code> 匹配任意字符（含点），<code>?</code> 匹配单个字符。
+        例：<code>*.example.com</code> 拦截所有子域名（不含 example.com 本身）。<br>
+        例外：完整域名，不支持通配符；命中例外的域名不受黑名单影响。自定义解析优先于黑名单。</p>
+      <form id="dfForm" autocomplete="off">
+        <label for="dfBlock">黑名单（最多 64 条）</label>
+        <textarea id="dfBlock" class="pem" spellcheck="false" placeholder="*.ads.example.com&#10;tracker.example.net"></textarea>
+        <label for="dfAllow">例外（最多 32 条）</label>
+        <textarea id="dfAllow" class="pem" spellcheck="false" placeholder="good.ads.example.com"></textarea>
+        <div class="row" style="margin-top:8px">
+          <button type="submit" class="primary">保存黑名单</button>
+        </div>
+        <div id="dfMsg"></div>
+      </form>
+      <label for="dfTest" style="margin-top:12px">测试域名</label>
+      <div class="ssid-row">
+        <input type="text" id="dfTest" maxlength="63" placeholder="www.example.com">
+        <button type="button" id="dfTestBtn">测试</button>
+      </div>
+      <div id="dfTestOut" class="muted"></div>
+    </section>
+  </div>
+
+  <div class="panel" id="tab-site">
+<section class="card">
+      <h3>域名与证书</h3>
       <div class="stat" id="siteInfo">
         <span>域名</span><span id="siDomain">-</span>
         <span>证书来源</span><span id="siSrc">-</span>
@@ -207,9 +344,8 @@
         <p class="muted">新证书只对之后的新连接生效。修改域名时，DNS 自定义解析中的旧域名条目会自动改为新域名。</p>
       </form>
     </section>
-
-    <section class="card">
-      <h2>HTTP/2 自定义接口 <span class="muted" id="rtSite"></span></h2>
+<section class="card">
+      <h3>自定义接口 <span class="muted" id="rtSite"></span></h3>
       <ul id="rtList"></ul>
       <p class="muted" id="rtEmpty">还没有自定义接口。</p>
       <form id="rtForm" autocomplete="off">
@@ -229,52 +365,32 @@
         <div id="rtMsg"></div>
       </form>
     </section>
+  </div>
 
-    <section class="card">
-      <h2>DNS 自定义解析 <span class="muted" id="dnsCount"></span></h2>
-      <p class="muted">列表中的域名由本机直接应答；未配置的域名照常转发到上游 DNS。仅对连接本机热点的设备生效。</p>
-      <ul id="dnsList"></ul>
-      <form id="dnsForm" autocomplete="off">
-        <label for="dnsName">域名</label>
-        <input type="text" id="dnsName" maxlength="63" placeholder="www.example.com" required>
-        <label for="dnsIp">IPv4 地址</label>
-        <input type="text" id="dnsIp" maxlength="15" placeholder="留空 = 本机 AP 地址">
-        <div class="row" style="margin-top:8px">
-          <button type="submit" class="primary">保存解析</button>
-          <button type="button" id="dnsNew">清空</button>
+  <div class="panel" id="tab-log">
+    <section class="card log-card">
+      <div class="log-bar">
+        <div class="lv" id="lvBtns">
+          <button type="button" class="on E" data-lv="E">E</button>
+          <button type="button" class="on W" data-lv="W">W</button>
+          <button type="button" class="on I" data-lv="I">I</button>
+          <button type="button" class="on D" data-lv="D">D</button>
         </div>
-        <div id="dnsMsg"></div>
-      </form>
-    </section>
-
-    <section class="card">
-      <h2>DNS 黑名单 <span class="muted" id="dfCount"></span></h2>
-      <p class="muted">被拦截的域名回 NXDOMAIN（域名不存在）。每行一条，# 开头为注释。<br>
-        黑名单：不含通配符时精确匹配；<code>*</code> 匹配任意字符（含点），<code>?</code> 匹配单个字符。
-        例：<code>*.example.com</code> 拦截所有子域名（不含 example.com 本身）。<br>
-        例外：完整域名，不支持通配符；命中例外的域名不受黑名单影响。自定义解析优先于黑名单。</p>
-      <form id="dfForm" autocomplete="off">
-        <label for="dfBlock">黑名单（最多 64 条）</label>
-        <textarea id="dfBlock" class="pem" spellcheck="false" placeholder="*.ads.example.com&#10;tracker.example.net"></textarea>
-        <label for="dfAllow">例外（最多 32 条）</label>
-        <textarea id="dfAllow" class="pem" spellcheck="false" placeholder="good.ads.example.com"></textarea>
-        <div class="row" style="margin-top:8px">
-          <button type="submit" class="primary">保存黑名单</button>
-        </div>
-        <div id="dfMsg"></div>
-      </form>
-      <label for="dfTest" style="margin-top:12px">测试域名</label>
-      <div class="ssid-row">
-        <input type="text" id="dfTest" maxlength="63" placeholder="www.example.com">
-        <button type="button" id="dfTestBtn">测试</button>
+        <input type="text" id="logSearch" placeholder="搜索（如 dns、h2、上游）">
+        <label class="check"><input type="checkbox" id="hitOnly">仅命中</label>
+        <label class="check"><input type="checkbox" id="autoScroll" checked>自动滚动</label>
+        <button type="button" class="small" id="pauseBtn">暂停</button>
+        <button type="button" class="small" id="clearBtn">清空</button>
+        <button type="button" class="small" id="dlBtn">下载</button>
       </div>
-      <div id="dfTestOut" class="muted"></div>
+      <pre id="log"></pre>
+      <div class="log-foot"><span id="logStat">-</span><span class="spacer"></span><span id="logState"></span></div>
     </section>
   </div>
 
-  <div style="display:grid; grid-template-columns:minmax(0,1fr); grid-template-rows:auto 1fr; gap:16px; min-width:0">
-    <section class="card">
-      <h2>配置备份（YAML）</h2>
+  <div class="panel" id="tab-backup">
+<section class="card wide">
+      <h3>配置备份（YAML）</h3>
       <p class="muted">导出文件包含 Wi-Fi 密码和网页上传的私钥（明文），请妥善保管。
         导入时，文件中出现的段（wifi、dns、dns_blacklist、h2_site、h2_routes）会整体替换设备上对应的配置，未出现的段保持不变；
         wifi 段最后应用，改了热点时当前连接会断开。</p>
@@ -286,20 +402,9 @@
       <div id="bkMsg"></div>
       <ol id="bkLog"></ol>
     </section>
-
-    <section class="card log-card">
-      <div class="log-head">
-        <h2>实时日志 <span class="dot" id="wsDot"></span></h2>
-        <div class="row">
-          <label class="check" style="margin:0"><input type="checkbox" id="autoScroll" checked>自动滚动</label>
-          <button type="button" id="pauseBtn">暂停</button>
-          <button type="button" id="clearBtn">清空</button>
-        </div>
-      </div>
-      <pre id="log"></pre>
-    </section>
   </div>
-</main>
+  </main>
+</div>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -383,8 +488,9 @@ $('cfg').onsubmit = async ev => {
 
 $('restartBtn').onclick = async () => {
   if (!confirm('确定重启设备？')) return;
-  try { await fetch('/api/restart', { method: 'POST' }); showMsg('设备正在重启…', true); }
-  catch (e) { showMsg('请求失败：' + e, false); }
+  const m = $('ovMsg');
+  try { await fetch('/api/restart', { method: 'POST' }); m.textContent = '设备正在重启…'; m.className = 'ok'; }
+  catch (e) { m.textContent = '请求失败：' + e; m.className = 'bad'; }
 };
 
 /* ---------- 扫描上游 ---------- */
@@ -1015,12 +1121,27 @@ $('dfTestBtn').onclick = async () => {
 $('dfTest').onkeydown = e => { if (e.key === 'Enter') $('dfTestBtn').click(); };
 dfLoad().catch(() => dfShowMsg('读取 DNS 黑名单失败', false));
 
-loadConfig().catch(() => showMsg('读取配置失败', false)).then(scan);
+loadConfig().catch(() => showMsg('读取配置失败', false));
+
+/* ---------- 标签页 ---------- */
+const TABS = ['overview', 'wifi', 'dns', 'site', 'log', 'backup'];
+let curTab = '', scannedOnce = false;
+function showTab(t) {
+  if (!TABS.includes(t)) t = 'overview';
+  curTab = t;
+  for (const id of TABS) $('tab-' + id).classList.toggle('active', id === t);
+  for (const a of document.querySelectorAll('#tabs a[data-tab]')) a.classList.toggle('active', a.dataset.tab === t);
+  if (t === 'log') { unread = 0; $('logBadge').textContent = ''; renderLog(); }
+  if (t === 'wifi' && !scannedOnce) { scannedOnce = true; scan(); }   /* 扫描会短暂影响热点，只在首次进入时自动扫描 */
+  window.scrollTo(0, 0);
+}
+window.addEventListener('hashchange', () => showTab(location.hash.slice(1)));
 
 /* ---------- 实时日志 ---------- */
 const logEl = $('log');
-const MAX_LINES = 2000;
-let paused = false, pending = [], partial = '', decoder = new TextDecoder('utf-8');
+const KEEP_LINES = 3000, SHOW_LINES = 1500;
+let logLines = [], paused = false, partial = '', decoder = new TextDecoder('utf-8'), unread = 0, newWhilePaused = 0;
+const lvOn = { E: true, W: true, I: true, D: true };
 
 /* 设备在命中自定义接口时输出：h2_test: HIT path=<配置路径> method= proto= peer= req=<请求路径> */
 const HIT_RE = /\bh2_test: HIT path=(\S+) method=(\S+) proto=(\S+) peer=(\S+) req=(.*)$/;
@@ -1052,59 +1173,124 @@ function onHit(m) {
 }
 
 function levelOf(line) {
-  const m = /^(?:\x1b\[[0-9;]*m)?([EWIDV]) \(/.exec(line);
-  return m ? m[1] : '';
+  const m = /^([EWIDV]) \(/.exec(line);
+  return m ? (m[1] === 'V' ? 'D' : m[1]) : '';
 }
-function appendLines(lines) {
-  const frag = document.createDocumentFragment();
-  for (const raw of lines) {
-    const line = raw.replace(/\x1b\[[0-9;]*m/g, '');
-    const div = document.createElement('div');
-    const lv = levelOf(line);
-    if (lv) div.className = lv;
-    if (HIT_RE.test(line)) div.classList.add('hit');
-    div.textContent = line;
-    frag.appendChild(div);
+function logFilter() {
+  const q = $('logSearch').value.trim().toLowerCase(), hitOnly = $('hitOnly').checked;
+  return l => (!l.lv || lvOn[l.lv]) && (!hitOnly || l.hit) && (!q || l.low.includes(q));
+}
+function lineEl(l, q) {
+  const div = document.createElement('div');
+  if (l.lv) div.className = l.lv;
+  if (l.hit) div.classList.add('hit');
+  if (q) {
+    /* 高亮搜索词 */
+    let i = 0, k;
+    while ((k = l.low.indexOf(q, i)) >= 0) {
+      div.append(document.createTextNode(l.text.slice(i, k)));
+      const m = document.createElement('mark'); m.textContent = l.text.slice(k, k + q.length); div.append(m);
+      i = k + q.length;
+    }
+    div.append(document.createTextNode(l.text.slice(i)));
+  } else {
+    div.textContent = l.text;
   }
+  return div;
+}
+function updateLogStat() {
+  $('logStat').textContent = `显示 ${logEl.childElementCount} 行 / 缓存 ${logLines.length} 行`;
+  $('logState').textContent = paused ? `已暂停${newWhilePaused ? `，新增 ${newWhilePaused} 行` : ''}` : '';
+}
+function renderLog() {
+  if (curTab !== 'log') return;
+  const f = logFilter(), q = $('logSearch').value.trim().toLowerCase();
+  const rows = logLines.filter(f).slice(-SHOW_LINES);
+  const frag = document.createDocumentFragment();
+  for (const l of rows) frag.appendChild(lineEl(l, q));
+  logEl.textContent = '';
   logEl.appendChild(frag);
-  while (logEl.childElementCount > MAX_LINES) logEl.firstElementChild.remove();
   if ($('autoScroll').checked) logEl.scrollTop = logEl.scrollHeight;
+  updateLogStat();
+}
+function appendLive(lines) {
+  if (curTab !== 'log' || paused) return;
+  const f = logFilter(), q = $('logSearch').value.trim().toLowerCase();
+  const frag = document.createDocumentFragment();
+  for (const l of lines) if (f(l)) frag.appendChild(lineEl(l, q));
+  logEl.appendChild(frag);
+  while (logEl.childElementCount > SHOW_LINES) logEl.firstElementChild.remove();
+  if ($('autoScroll').checked) logEl.scrollTop = logEl.scrollHeight;
+  updateLogStat();
 }
 function onText(text) {
   partial += text;
   const parts = partial.split(/\r?\n/);
   partial = parts.pop();
   if (!parts.length) return;
-  /* 暂停滚动时也照常提示 */
-  if (Date.now() >= liveAfter) {
-    for (const l of parts) {
-      const m = HIT_RE.exec(l.replace(/\x1b\[[0-9;]*m/g, ''));
-      if (m) onHit(m);
-    }
+  const live = Date.now() >= liveAfter;
+  const lines = [];
+  for (const raw of parts) {
+    const t = raw.replace(/\x1b\[[0-9;]*m/g, '');
+    if (!t) continue;
+    const m = HIT_RE.exec(t);
+    const l = { text: t, low: t.toLowerCase(), lv: levelOf(t), hit: !!m };
+    lines.push(l);
+    if (m && live) onHit(m);                                   /* 任何标签页、暂停时都提示 */
+    if (live && curTab !== 'log' && (l.lv === 'E' || l.lv === 'W' || l.hit)) unread++;
   }
-  if (paused) { pending.push(...parts); if (pending.length > MAX_LINES) pending.splice(0, pending.length - MAX_LINES); }
-  else appendLines(parts);
+  logLines.push(...lines);
+  if (logLines.length > KEEP_LINES) logLines.splice(0, logLines.length - KEEP_LINES);
+  if (paused) newWhilePaused += lines.length;
+  $('logBadge').textContent = unread ? (unread > 99 ? '99+' : unread) : '';
+  appendLive(lines);
+  if (curTab === 'log' && paused) updateLogStat();
 }
 
 function connectWs() {
   const ws = new WebSocket(`ws://${location.host}/ws`);
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => {
-    $('wsDot').className = 'dot ok'; logEl.textContent = ''; partial = ''; decoder = new TextDecoder('utf-8');
+    $('wsDot').className = 'dot ok'; logLines = []; partial = ''; decoder = new TextDecoder('utf-8');
     liveAfter = Date.now() + 1500;
+    renderLog();
   };
   ws.onmessage = ev => onText(typeof ev.data === 'string' ? ev.data : decoder.decode(ev.data, { stream: true }));
   ws.onclose = () => { $('wsDot').className = 'dot bad'; setTimeout(connectWs, 2000); };
   ws.onerror = () => ws.close();
 }
-connectWs();
 
+for (const b of $('lvBtns').children) {
+  b.onclick = () => { lvOn[b.dataset.lv] = !lvOn[b.dataset.lv]; b.classList.toggle('on', lvOn[b.dataset.lv]); renderLog(); };
+}
+let searchTimer = 0;
+$('logSearch').oninput = () => { clearTimeout(searchTimer); searchTimer = setTimeout(renderLog, 150); };
+$('hitOnly').onchange = renderLog;
+$('autoScroll').onchange = () => { if ($('autoScroll').checked) logEl.scrollTop = logEl.scrollHeight; };
+logEl.addEventListener('scroll', () => {
+  /* 手动向上滚动时暂停自动滚动，滚回底部恢复 */
+  const atBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 30;
+  if ($('autoScroll').checked !== atBottom) $('autoScroll').checked = atBottom;
+});
 $('pauseBtn').onclick = () => {
   paused = !paused;
   $('pauseBtn').textContent = paused ? '继续' : '暂停';
-  if (!paused && pending.length) { appendLines(pending); pending = []; }
+  newWhilePaused = 0;
+  if (!paused) renderLog(); else updateLogStat();
 };
-$('clearBtn').onclick = () => { logEl.textContent = ''; pending = []; };
+$('clearBtn').onclick = () => { logLines = []; renderLog(); };
+$('dlBtn').onclick = () => {
+  const blob = new Blob([logLines.map(l => l.text).join('\n') + '\n'], { type: 'text/plain' });
+  const d = new Date(), pad = n => String(n).padStart(2, '0');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `esp32-log-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.txt`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+};
+
+showTab(location.hash.slice(1));
+connectWs();
 </script>
 </body>
 </html>

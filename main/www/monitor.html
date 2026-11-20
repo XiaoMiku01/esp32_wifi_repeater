@@ -58,6 +58,30 @@
   #blkList li { display:flex; align-items:center; gap:8px; padding:4px 0; border-bottom:1px solid var(--line); }
   #blkList li .d { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; font-family:ui-monospace,Menlo,monospace; }
   .up { color:#2563eb; } .down { color:#16a34a; }
+  /* 手机：紧凑布局，隐藏次要列（MAC、首次出现、累计、远端、时长） */
+  @media (max-width: 760px) {
+    header { padding:10px 12px; gap:8px; }
+    header h1 { font-size:15px; }
+    main { padding:10px; gap:10px; }
+    .card { padding:12px; }
+    .card h2 { font-size:13px; }
+    input[type=text], select { font-size:16px; }
+    .card h2 input[type=text] { width:100%; order:10; }
+    th, td { padding:5px 6px; font-size:12px; }
+    .tbl { max-height:60vh; }
+    td.dom { max-width:160px; }
+    td.dom.url { max-width:220px; }
+    #tClients th:nth-child(4), #tClients td:nth-child(4),
+    #tClients th:nth-child(5), #tClients td:nth-child(5),
+    #tClients th:nth-child(8), #tClients td:nth-child(8),
+    #tClients th:nth-child(9), #tClients td:nth-child(9),
+    #tFlows th:nth-child(4), #tFlows td:nth-child(4),
+    #tFlows th:nth-child(7), #tFlows td:nth-child(7),
+    #tFlows th:nth-child(8), #tFlows td:nth-child(8),
+    #tFlows th:nth-child(9), #tFlows td:nth-child(9) { display:none; }
+    .stats { grid-template-columns:repeat(2, 1fr); }
+    .stat .v { font-size:16px; }
+  }
 </style>
 </head>
 <body>
@@ -102,7 +126,7 @@
   <section class="card">
     <h2>设备 <span class="muted">（本次开机，点击一行可筛选下方连接和 DNS 记录）</span></h2>
     <div class="tbl">
-      <table>
+      <table id="tClients">
         <thead><tr><th>状态</th><th>IP</th><th>主机名</th><th>MAC</th><th>首次出现</th>
           <th class="num">↑ 速率</th><th class="num">↓ 速率</th><th class="num">累计 ↑</th><th class="num">累计 ↓</th>
           <th class="num">DNS</th></tr></thead>
@@ -119,7 +143,7 @@
       <label class="row muted" style="gap:4px"><input type="checkbox" id="hideClosed" checked>隐藏已关闭</label>
     </h2>
     <div class="tbl">
-      <table>
+      <table id="tFlows">
         <thead><tr><th>设备</th><th>类型</th><th>域名 / URL</th><th>远端</th>
           <th class="num">↑ 速率</th><th class="num">↓ 速率</th><th class="num">累计 ↑</th><th class="num">累计 ↓</th>
           <th class="num">时长</th><th>状态</th><th></th></tr></thead>
