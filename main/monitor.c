@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -113,8 +114,9 @@ static int s_n_block;
 static asm_t *s_asm;
 static uint8_t s_scratch[ASM_CAP];
 
-/* 性能统计 */
-static uint64_t s_perf_pkts, s_perf_cycles, s_perf_last_pkts;
+/* 性能统计。周期计数器每个核各一个，tcpip 线程未绑核，
+ * 跨核迁移的样本无效（会出现接近 2^32 的差值），按核号比较后丢弃 */
+static uint64_t s_perf_pkts, s_perf_cycles, s_perf_last_pkts, s_perf_samples;
 static uint32_t s_perf_max, s_perf_pps;
 
 static inline uint32_t now_s(void)
@@ -593,6 +595,7 @@ int monitor_ip4_canforward(struct pbuf *p, uint32_t dest_host_order)
     if (!s_ready || !s_enabled || p->len < IP_HLEN) {
         return -1;
     }
+    int core0 = xPortGetCoreID();
     uint32_t c0 = esp_cpu_get_cycle_count();
     const struct ip_hdr *iph = (const struct ip_hdr *)p->payload;
     if (IPH_V(iph) != 4) {
@@ -667,8 +670,11 @@ int monitor_ip4_canforward(struct pbuf *p, uint32_t dest_host_order)
 
     uint32_t dt = esp_cpu_get_cycle_count() - c0;
     s_perf_pkts++;
-    s_perf_cycles += dt;
-    if (dt > s_perf_max) s_perf_max = dt;
+    if (xPortGetCoreID() == core0) {
+        s_perf_samples++;
+        s_perf_cycles += dt;
+        if (dt > s_perf_max) s_perf_max = dt;
+    }
     return verdict;
 }
 
@@ -923,7 +929,7 @@ char *monitor_live_json(size_t *len)
     esp_clk_tree_src_get_freq_hz(SOC_MOD_CLK_CPU, ESP_CLK_TREE_SRC_FREQ_PRECISION_CACHED, &mhz);
     mhz /= 1000000;
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    uint32_t avg = s_perf_pkts ? (uint32_t)(s_perf_cycles / s_perf_pkts) : 0;
+    uint32_t avg = s_perf_samples ? (uint32_t)(s_perf_cycles / s_perf_samples) : 0;
     sb_printf(&s, "{\"uptime\":%lu,\"enabled\":%s,\"perf\":{\"pkts\":%llu,\"pps\":%lu,\"avg_cycles\":%lu,"
               "\"max_cycles\":%lu,\"cpu_mhz\":%lu},\"clients\":[",
               (unsigned long)now_s(), s_enabled ? "true" : "false", (unsigned long long)s_perf_pkts,
@@ -1026,51 +1032,89 @@ void monitor_set_enabled(bool en)
 
 void monitor_reset_perf(void)
 {
-    s_perf_pkts = s_perf_cycles = s_perf_last_pkts = 0;
+    s_perf_pkts = s_perf_cycles = s_perf_last_pkts = s_perf_samples = 0;
     s_perf_max = 0;
 }
 
-/* 合成包压测钩子开销：64 条连接，上下行交替，结束后清除测试数据 */
+/* 合成包压测钩子开销：64 条连接，上下行交替。
+ * 在绑定 core 1 的任务里运行（周期计数器按核独立），记录每个样本，报告中位数/p90/p99/最大值；
+ * 结束后清除测试数据 */
+#define BENCH_FLOWS   64
+#define BENCH_ROUNDS  300
+#define BENCH_N       (BENCH_FLOWS * BENCH_ROUNDS)
+
+typedef struct {
+    uint32_t *samples;
+    SemaphoreHandle_t done;
+} bench_ctx_t;
+
+static void bench_task(void *arg)
+{
+    bench_ctx_t *ctx = arg;
+    struct pbuf *p = pbuf_alloc(PBUF_RAW, IP_HLEN + TCP_HLEN + 64, PBUF_RAM);
+    if (p) {
+        struct ip_hdr *iph = (struct ip_hdr *)p->payload;
+        struct tcp_hdr *th = (struct tcp_hdr *)((uint8_t *)p->payload + IP_HLEN);
+        memset(p->payload, 0, p->len);
+        IPH_VHL_SET(iph, 4, IP_HLEN / 4);
+        IPH_LEN_SET(iph, lwip_htons(p->len));
+        IPH_PROTO_SET(iph, IP_PROTO_TCP);
+        TCPH_HDRLEN_FLAGS_SET(th, 5, TCP_ACK);
+        uint32_t bench_cip = s_ap_net | lwip_htonl(250);
+        int n = 0;
+        for (int r = 0; r < BENCH_ROUNDS; r++) {
+            for (int i = 0; i < BENCH_FLOWS; i++) {
+                uint32_t rip = lwip_htonl(0xC6336400u | (uint32_t)(i + 1));   /* 198.51.100.x */
+                bool up = (r + i) & 1;
+                iph->src.addr = up ? bench_cip : rip;
+                iph->dest.addr = up ? rip : bench_cip;
+                th->src = lwip_htons(up ? 40000 + i : 443);
+                th->dest = lwip_htons(up ? 443 : 40000 + i);
+                th->seqno = lwip_htonl(r * 100);
+                uint32_t c0 = esp_cpu_get_cycle_count();
+                monitor_ip4_canforward(p, 0);
+                ctx->samples[n++] = esp_cpu_get_cycle_count() - c0;
+            }
+        }
+        pbuf_free(p);
+    }
+    xSemaphoreGive(ctx->done);
+    vTaskDelete(NULL);
+}
+
+static int cmp_u32(const void *a, const void *b)
+{
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? -1 : x > y;
+}
+
 char *monitor_bench_json(size_t *len)
 {
-    const int flows = 64, rounds = 300;
-    struct pbuf *p = pbuf_alloc(PBUF_RAW, IP_HLEN + TCP_HLEN + 64, PBUF_RAM);
-    if (!p) return NULL;
-    struct ip_hdr *iph = (struct ip_hdr *)p->payload;
-    struct tcp_hdr *th = (struct tcp_hdr *)((uint8_t *)p->payload + IP_HLEN);
-    memset(p->payload, 0, p->len);
-    IPH_VHL_SET(iph, 4, IP_HLEN / 4);
-    IPH_LEN_SET(iph, lwip_htons(p->len));
-    IPH_PROTO_SET(iph, IP_PROTO_TCP);
-    TCPH_HDRLEN_FLAGS_SET(th, 5, TCP_ACK);
-    uint32_t bench_cip = s_ap_net | lwip_htonl(250);
+    bench_ctx_t ctx = {
+        .samples = heap_caps_malloc(BENCH_N * sizeof(uint32_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+        .done = xSemaphoreCreateBinary(),
+    };
+    if (!ctx.samples || !ctx.done) {
+        free(ctx.samples);
+        if (ctx.done) vSemaphoreDelete(ctx.done);
+        return NULL;
+    }
     bool was = s_enabled;
     s_enabled = true;
-
-    uint64_t total = 0;
-    uint32_t mx = 0;
-    int n = 0;
-    for (int r = 0; r < rounds; r++) {
-        for (int i = 0; i < flows; i++) {
-            uint32_t rip = lwip_htonl(0xC6336400u | (uint32_t)(i + 1));   /* 198.51.100.x */
-            bool up = (r + i) & 1;
-            iph->src.addr = up ? bench_cip : rip;
-            iph->dest.addr = up ? rip : bench_cip;
-            th->src = lwip_htons(up ? 40000 + i : 443);
-            th->dest = lwip_htons(up ? 443 : 40000 + i);
-            th->seqno = lwip_htonl(r * 100);
-            uint32_t c0 = esp_cpu_get_cycle_count();
-            monitor_ip4_canforward(p, 0);
-            uint32_t dt = esp_cpu_get_cycle_count() - c0;
-            total += dt;
-            if (dt > mx) mx = dt;
-            n++;
-        }
+    if (xTaskCreatePinnedToCore(bench_task, "mon_bench", 4096, &ctx, 5, NULL, 1) != pdPASS) {
+        s_enabled = was;
+        free(ctx.samples);
+        vSemaphoreDelete(ctx.done);
+        return NULL;
     }
-    pbuf_free(p);
+    if (xSemaphoreTake(ctx.done, pdMS_TO_TICKS(30000)) != pdTRUE) {
+        /* 任务仍可能在写 samples/ctx（ctx 在本栈上，因此继续等待直到完成） */
+        xSemaphoreTake(ctx.done, portMAX_DELAY);
+    }
     s_enabled = was;
 
     /* 清除测试数据 */
+    uint32_t bench_cip = s_ap_net | lwip_htonl(250);
     xSemaphoreTake(s_lock, portMAX_DELAY);
     for (int i = 0; i < FLOW_MAX; i++) {
         if (s_flows[i].used && s_flows[i].cip == bench_cip) flow_free(i);
@@ -1080,15 +1124,26 @@ char *monitor_bench_json(size_t *len)
     }
     xSemaphoreGive(s_lock);
 
+    sb_t s;
+    if (!sb_init(&s, 512)) {
+        free(ctx.samples);
+        vSemaphoreDelete(ctx.done);
+        return NULL;
+    }
+    uint64_t sum = 0;
+    for (int i = 0; i < BENCH_N; i++) sum += ctx.samples[i];
+    qsort(ctx.samples, BENCH_N, sizeof(uint32_t), cmp_u32);
     uint32_t hz = 0;
     esp_clk_tree_src_get_freq_hz(SOC_MOD_CLK_CPU, ESP_CLK_TREE_SRC_FREQ_PRECISION_CACHED, &hz);
-    double avg = (double)total / n;
-    double us = hz ? avg / (hz / 1e6) : 0;
-    sb_t s;
-    if (!sb_init(&s, 512)) return NULL;
-    sb_printf(&s, "{\"packets\":%d,\"flows\":%d,\"avg_cycles\":%.0f,\"max_cycles\":%lu,\"avg_us\":%.2f,"
-              "\"cpu_mhz\":%lu,\"max_pps_hook_only\":%.0f}",
-              n, flows, avg, (unsigned long)mx, us, (unsigned long)(hz / 1000000), us > 0 ? 1e6 / us : 0);
+    double mhz = hz / 1e6;
+    double med = ctx.samples[BENCH_N / 2] / mhz, p90 = ctx.samples[BENCH_N * 90 / 100] / mhz;
+    double p99 = ctx.samples[BENCH_N * 99 / 100] / mhz, mx = ctx.samples[BENCH_N - 1] / mhz;
+    double mean = (double)sum / BENCH_N / mhz;
+    sb_printf(&s, "{\"packets\":%d,\"flows\":%d,\"cpu_mhz\":%.0f,\"median_us\":%.2f,\"p90_us\":%.2f,"
+              "\"p99_us\":%.2f,\"max_us\":%.1f,\"mean_us\":%.2f,\"max_pps_hook_only\":%.0f}",
+              BENCH_N, BENCH_FLOWS, mhz, med, p90, p99, mx, mean, med > 0 ? 1e6 / med : 0);
+    free(ctx.samples);
+    vSemaphoreDelete(ctx.done);
     *len = s.len;
     return s.b;
 }
@@ -1098,6 +1153,7 @@ char *monitor_bench_json(size_t *len)
 void monitor_init(esp_netif_t *ap)
 {
     s_lock = xSemaphoreCreateMutex();
+    /* 实测放内部 RAM 与 PSRAM 每包耗时相同（中位数均为 7.5 µs），放 PSRAM 省内部 RAM */
     s_clients = ps_calloc(CLIENT_MAX, sizeof(client_t));
     s_flows = ps_calloc(FLOW_MAX, sizeof(flow_t));
     s_dns = ps_calloc(DNSLOG_MAX, sizeof(dnslog_t));

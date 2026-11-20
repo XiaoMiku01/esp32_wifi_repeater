@@ -342,8 +342,9 @@ $('benchBtn').onclick = async () => {
   $('benchBtn').disabled = true; $('benchOut').textContent = '压测中…';
   try {
     const b = await (await fetch('/api/mon/bench', { cache: 'no-store' })).json();
-    $('benchOut').textContent = `合成 ${b.packets} 个包 / ${b.flows} 条连接：平均 ${b.avg_us} µs/包（${b.avg_cycles} 周期），` +
-      `最大 ${(b.max_cycles / b.cpu_mhz).toFixed(1)} µs；仅钩子可承受约 ${Math.round(b.max_pps_hook_only).toLocaleString()} 包/秒`;
+    $('benchOut').textContent = `合成 ${b.packets} 个包 / ${b.flows} 条连接：中位数 ${b.median_us} µs/包，` +
+      `p90 ${b.p90_us} µs，p99 ${b.p99_us} µs，最大 ${b.max_us} µs；按中位数仅钩子可承受约 ` +
+      `${Math.round(b.max_pps_hook_only).toLocaleString()} 包/秒`;
   } catch (e) { $('benchOut').textContent = '压测失败：' + e.message; }
   $('benchBtn').disabled = false;
 };
