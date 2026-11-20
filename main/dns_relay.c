@@ -21,6 +21,7 @@
 #include "lwip/sockets.h"
 #include "repeater.h"
 #include "monitor.h"
+#include "dns_filter.h"
 
 #define DNS_PORT      53
 #define BUF_SIZE      1500
@@ -426,6 +427,15 @@ static void dns_relay_task(void *arg)
                 int len = build_local_answer(buf, qend, qtype, ip);
                 sendto(lsock, buf, len, 0, (struct sockaddr *)&from, flen);
                 monitor_dns_query(cip, qname, qtype, MON_DNS_LOCAL, ip);
+                continue;
+            }
+
+            /* 配置页 DNS 黑名单（例外优先）：回 NXDOMAIN */
+            if (qend > 0 && qend + 16 <= (int)sizeof(buf) && dns_filter_check(qname, NULL, 0) == DNSF_BLOCK) {
+                int len = build_local_answer(buf, qend, 0, 0);
+                buf[3] = 0x83;
+                sendto(lsock, buf, len, 0, (struct sockaddr *)&from, flen);
+                monitor_dns_query(cip, qname, qtype, MON_DNS_FILTERED, 0);
                 continue;
             }
 

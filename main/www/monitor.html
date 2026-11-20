@@ -151,7 +151,8 @@ let uptime = 0, selIp = '', blocked = new Set();
 let dnsLast = 0, dnsRows = [];
 const DNS_KEEP = 500;
 const QT = { 1: 'A', 2: 'NS', 5: 'CNAME', 6: 'SOA', 12: 'PTR', 15: 'MX', 16: 'TXT', 28: 'AAAA', 33: 'SRV', 64: 'SVCB', 65: 'HTTPS', 255: 'ANY' };
-const RES = { forward: ['转发', ''], local: ['本地应答', 'ok'], blocked: ['已拦截', 'bad'] };
+const RES = { forward: ['转发', ''], local: ['本地应答', 'ok'], blocked: ['已拦截（记录页）', 'bad'],
+              filtered: ['已拦截（DNS 黑名单）', 'bad'] };
 const SRC = { dns: 'DNS', sni: 'SNI', host: 'Host' };
 
 function fmtBytes(n) {
@@ -292,8 +293,8 @@ function renderDns() {
     const [rt, rc] = RES[r.res] || [r.res, ''];
     const res = el('td'); res.appendChild(el('span', rt, 'badge ' + rc));
     const name = el('td', r.name, 'dom'); name.title = r.name;
-    const act = el('td'); act.appendChild(r.res === 'blocked' ? el('span') : blockBtn(r.name));
-    const tr = el('tr', undefined, r.res === 'blocked' ? 'blocked' : '');
+    const act = el('td'); act.appendChild((r.res === 'blocked' || r.res === 'filtered') ? el('span') : blockBtn(r.name));
+    const tr = el('tr', undefined, (r.res === 'blocked' || r.res === 'filtered') ? 'blocked' : '');
     const t = el('td', fmtAgo(r.t)); t.title = fmtAt(r.t);
     tr.append(t, el('td', r.cip), name, el('td', QT[r.qtype] || r.qtype), res, el('td', r.ans.join(', ') || '-'), act);
     tb.appendChild(tr);

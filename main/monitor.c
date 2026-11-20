@@ -1074,7 +1074,7 @@ char *monitor_dns_json(uint32_t since, size_t *len)
 {
     sb_t s;
     if (!sb_init(&s, 64 * 1024)) return NULL;
-    static const char *const res_name[] = { "forward", "local", "blocked" };
+    static const char *const res_name[] = { "forward", "local", "blocked", "filtered" };
     xSemaphoreTake(s_lock, portMAX_DELAY);
     uint32_t last = s_dns_seq;
     uint32_t start = since + 1;
@@ -1088,7 +1088,7 @@ char *monitor_dns_json(uint32_t since, size_t *len)
         ip_str(e->cip, ip);
         sb_printf(&s, "%s{\"id\":%lu,\"t\":%lu,\"cip\":\"%s\",\"name\":\"%s\",\"qtype\":%u,\"res\":\"%s\",\"ans\":[",
                   id == start ? "" : ",", (unsigned long)id, (unsigned long)e->t, ip, e->name, e->qtype,
-                  res_name[e->res % 3]);
+                  res_name[e->res % 4]);
         for (int k = 0; k < e->nans; k++) {
             ip_str(e->ans[k], ip);
             sb_printf(&s, "%s\"%s\"", k ? "," : "", ip);

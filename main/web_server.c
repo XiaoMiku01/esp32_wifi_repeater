@@ -20,6 +20,8 @@
  *   GET  /api/mon/block  黑名单；POST action=add|del&domain=
  *   POST /api/mon/ctl    action=enable|disable|reset_perf
  *   GET  /api/mon/bench  合成包压测转发钩子开销
+ *   GET  /api/dnsblock  DNS 黑名单与例外（?test=<域名> 查看该域名的处理结果）
+ *   POST /api/dnsblock  block=<每行一条>&allow=<每行一条>，整体替换
  *   GET  /api/export   导出全部配置 JSON（含 Wi-Fi 密码与网页上传的私钥），网页端转为 YAML；
  *                      导入由网页解析 YAML 后逐段调用上述接口完成
  *   GET  /ws           WebSocket，推送实时日志（二进制帧，UTF-8 文本）
@@ -38,6 +40,7 @@
 #include "h2_routes.h"
 #include "h2_site.h"
 #include "monitor.h"
+#include "dns_filter.h"
 #include "lwip/inet.h"
 
 static const char *TAG = "web";
@@ -770,6 +773,83 @@ static esp_err_t mon_bench_get(httpd_req_t *req)
     return send_owned_json(req, b, len);
 }
 
+/* ---------- DNS 黑名单 ---------- */
+
+/* GET：列表；带 ?test=<域名> 时按 DNS 中继的判定顺序给出该域名的处理结果 */
+static esp_err_t dnsblock_get(httpd_req_t *req)
+{
+    char q[128], name[80];
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK &&
+        httpd_query_key_value(q, "test", name, sizeof(name)) == ESP_OK) {
+        char dec[80];
+        if (!url_decode(name, dec, sizeof(dec))) {
+            return send_json_error(req, "400 Bad Request", "域名无效");
+        }
+        size_t n = strlen(dec);
+        while (n && dec[n - 1] == '.') dec[--n] = '\0';
+        for (char *p = dec; *p; p++) *p = (char)tolower((unsigned char)*p);
+        for (char *p = dec; *p; p++) {
+            if (!(isalnum((unsigned char)*p) || *p == '-' || *p == '_' || *p == '.')) {
+                return send_json_error(req, "400 Bad Request", "域名只能包含字母、数字、- _ .");
+            }
+        }
+        const char *result, *detail = "";
+        char rule[72] = "";
+        uint32_t ip;
+        if (monitor_is_blocked(dec)) {
+            result = "blocked_monitor";             /* 记录页临时黑名单 */
+        } else if (dns_relay_get_override(dec, &ip)) {
+            result = "local";                       /* 自定义解析 */
+        } else {
+            dnsf_result_t r = dns_filter_check(dec, rule, sizeof(rule));
+            result = r == DNSF_BLOCK ? "blocked" : r == DNSF_ALLOW ? "allowed" : "forward";
+            detail = rule;
+        }
+        char buf[256];
+        snprintf(buf, sizeof(buf), "{\"name\":\"%s\",\"result\":\"%s\",\"rule\":\"%s\"}", dec, result, detail);
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, buf);
+    }
+    size_t len = 0;
+    char *b = dns_filter_json(&len);
+    return send_owned_json(req, b, len);
+}
+
+static esp_err_t dnsblock_post(httpd_req_t *req)
+{
+    const size_t max = (DNSF_BLOCK_MAX + DNSF_ALLOW_MAX) * (DNSF_NAME_MAX + 2) * 3 + 64;
+    if (req->content_len == 0 || req->content_len > max) {
+        return send_json_error(req, "413 Payload Too Large", "请求过大");
+    }
+    char *body = malloc(req->content_len + 1);
+    if (!body) {
+        return send_json_error(req, "500 Internal Server Error", "内存不足");
+    }
+    size_t got = 0;
+    while (got < req->content_len) {
+        int r = httpd_req_recv(req, body + got, req->content_len - got);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (r <= 0) {
+            free(body);
+            return ESP_FAIL;
+        }
+        got += r;
+    }
+    body[got] = '\0';
+    char *block = form_get_alloc(body, "block");
+    char *allow = form_get_alloc(body, "allow");
+    free(body);
+    char err[200];
+    esp_err_t e = dns_filter_set(block ? block : "", allow ? allow : "", err, sizeof(err));
+    free(block);
+    free(allow);
+    if (e != ESP_OK) {
+        return send_json_error(req, "400 Bad Request", err);
+    }
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
 /* ---------- 配置导出（含密码与私钥，网页端转换为 YAML） ---------- */
 
 static void chunk_json_str(httpd_req_t *req, const char *s)
@@ -827,7 +907,16 @@ static esp_err_t export_get(httpd_req_t *req)
     ctx.not_first = false;
     httpd_resp_sendstr_chunk(req, ",\"h2_routes\":[");
     h2_routes_foreach(route_chunk, &ctx);
-    httpd_resp_sendstr_chunk(req, "]}");
+    httpd_resp_sendstr_chunk(req, "],\"dns_blacklist\":");
+    size_t flen = 0;
+    char *fj = dns_filter_json(&flen);
+    if (fj) {
+        httpd_resp_send_chunk(req, fj, flen);
+        free(fj);
+    } else {
+        httpd_resp_sendstr_chunk(req, "null");
+    }
+    httpd_resp_sendstr_chunk(req, "}");
     ESP_LOGI(TAG, "配置已导出");
     return httpd_resp_sendstr_chunk(req, NULL);
 }
@@ -835,7 +924,7 @@ static esp_err_t export_get(httpd_req_t *req)
 esp_err_t web_server_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 26;
+    cfg.max_uri_handlers = 30;
     cfg.lru_purge_enable = true;
     cfg.stack_size = 6144;
 
@@ -860,6 +949,8 @@ esp_err_t web_server_start(void)
         { .uri = "/api/h2site",   .method = HTTP_GET,  .handler = h2site_get },
         { .uri = "/api/h2site",   .method = HTTP_POST, .handler = h2site_post },
         { .uri = "/api/export",   .method = HTTP_GET,  .handler = export_get },
+        { .uri = "/api/dnsblock", .method = HTTP_GET,  .handler = dnsblock_get },
+        { .uri = "/api/dnsblock", .method = HTTP_POST, .handler = dnsblock_post },
         { .uri = "/monitor",       .method = HTTP_GET,  .handler = monitor_page_get },
         { .uri = "/api/mon/live",  .method = HTTP_GET,  .handler = mon_live_get },
         { .uri = "/api/mon/dns",   .method = HTTP_GET,  .handler = mon_dns_get },

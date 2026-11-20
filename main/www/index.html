@@ -99,8 +99,8 @@
   #rtList .cnt { font-size:11px; padding:0 6px; border-radius:8px; background:#facc15; color:#111;
                  white-space:nowrap; }
   #rtList .cnt:empty { display:none; }
-  #rtMsg.ok, #dnsMsg.ok, #siteMsg.ok { color:var(--ok); }
-  #rtMsg.bad, #dnsMsg.bad, #siteMsg.bad { color:var(--bad); }
+  #rtMsg.ok, #dnsMsg.ok, #siteMsg.ok, #dfMsg.ok { color:var(--ok); }
+  #rtMsg.bad, #dnsMsg.bad, #siteMsg.bad, #dfMsg.bad { color:var(--bad); }
   #siteMsg.warn { color:#d97706; }
   #bkMsg.ok { color:var(--ok); } #bkMsg.bad { color:var(--bad); }
   #bkLog { margin:6px 0 0; padding-left:18px; font-size:12px; color:var(--muted); }
@@ -246,13 +246,37 @@
         <div id="dnsMsg"></div>
       </form>
     </section>
+
+    <section class="card">
+      <h2>DNS 黑名单 <span class="muted" id="dfCount"></span></h2>
+      <p class="muted">被拦截的域名回 NXDOMAIN（域名不存在）。每行一条，# 开头为注释。<br>
+        黑名单：不含通配符时精确匹配；<code>*</code> 匹配任意字符（含点），<code>?</code> 匹配单个字符。
+        例：<code>*.example.com</code> 拦截所有子域名（不含 example.com 本身）。<br>
+        例外：完整域名，不支持通配符；命中例外的域名不受黑名单影响。自定义解析优先于黑名单。</p>
+      <form id="dfForm" autocomplete="off">
+        <label for="dfBlock">黑名单（最多 64 条）</label>
+        <textarea id="dfBlock" class="pem" spellcheck="false" placeholder="*.ads.example.com&#10;tracker.example.net"></textarea>
+        <label for="dfAllow">例外（最多 32 条）</label>
+        <textarea id="dfAllow" class="pem" spellcheck="false" placeholder="good.ads.example.com"></textarea>
+        <div class="row" style="margin-top:8px">
+          <button type="submit" class="primary">保存黑名单</button>
+        </div>
+        <div id="dfMsg"></div>
+      </form>
+      <label for="dfTest" style="margin-top:12px">测试域名</label>
+      <div class="ssid-row">
+        <input type="text" id="dfTest" maxlength="63" placeholder="www.example.com">
+        <button type="button" id="dfTestBtn">测试</button>
+      </div>
+      <div id="dfTestOut" class="muted"></div>
+    </section>
   </div>
 
   <div style="display:grid; grid-template-columns:minmax(0,1fr); grid-template-rows:auto 1fr; gap:16px; min-width:0">
     <section class="card">
       <h2>配置备份（YAML）</h2>
       <p class="muted">导出文件包含 Wi-Fi 密码和网页上传的私钥（明文），请妥善保管。
-        导入时，文件中出现的段（wifi、dns、h2_site、h2_routes）会整体替换设备上对应的配置，未出现的段保持不变；
+        导入时，文件中出现的段（wifi、dns、dns_blacklist、h2_site、h2_routes）会整体替换设备上对应的配置，未出现的段保持不变；
         wifi 段最后应用，改了热点时当前连接会断开。</p>
       <div class="row">
         <button type="button" class="primary" id="bkExport">导出 YAML</button>
@@ -637,6 +661,13 @@ function toYaml(c) {
     out.push('  cert: ' + yblock(c.h2_site.cert, 4));
     out.push('  key: ' + yblock(c.h2_site.key, 4));
   }
+  out.push('# DNS 黑名单：block 支持通配符 * ?，allow 为完整域名例外');
+  const df = c.dns_blacklist || { block: [], allow: [] };
+  out.push('dns_blacklist:');
+  if (!df.block.length) out.push('  block: []');
+  else { out.push('  block:'); for (const b of df.block) out.push('    - ' + yq(b)); }
+  if (!df.allow.length) out.push('  allow: []');
+  else { out.push('  allow:'); for (const a of df.allow) out.push('    - ' + yq(a)); }
   out.push('# HTTP/2 自定义接口：路径 -> 应答 JSON');
   if (!c.h2_routes.length) out.push('h2_routes: []');
   else {
@@ -777,7 +808,7 @@ function parseYaml(text) {
 function checkConfig(d) {
   if (typeof d !== 'object' || d === null || Array.isArray(d)) throw new Error('顶层须为映射');
   if (d.version !== undefined && d.version !== 1) throw new Error(`不支持的 version: ${d.version}`);
-  const known = ['version', 'wifi', 'dns', 'h2_site', 'h2_routes', 'blocklist'];
+  const known = ['version', 'wifi', 'dns', 'dns_blacklist', 'h2_site', 'h2_routes', 'blocklist'];
   for (const k of Object.keys(d)) if (!known.includes(k)) throw new Error(`未知的段：${k}`);
   const str = (v, name) => {
     if (v === null || v === undefined) return '';
@@ -819,6 +850,16 @@ function checkConfig(d) {
     if (!domain) throw new Error('h2_site.domain 不能为空');
     if (!!cert !== !!key) throw new Error('h2_site 的 cert 和 key 须同时提供或同时省略');
     out.h2_site = { domain, cert, key };
+  }
+  if (d.dns_blacklist !== undefined) {
+    const b = d.dns_blacklist || {};
+    if (typeof b !== 'object' || Array.isArray(b)) throw new Error('dns_blacklist 须为映射（block / allow）');
+    const lst = (v, name) => {
+      if (v === undefined || v === null) return [];
+      if (!Array.isArray(v)) throw new Error(`${name} 须为列表`);
+      return v.map((x, k) => str(x, `${name}[${k + 1}]`).trim()).filter(x => x);
+    };
+    out.dns_blacklist = { block: lst(b.block, 'dns_blacklist.block'), allow: lst(b.allow, 'dns_blacklist.allow') };
   }
   /* 旧版本导出的 blocklist 段：黑名单已不再保存，导入时忽略 */
   if (d.blocklist !== undefined) out.ignoredBlocklist = true;
@@ -881,6 +922,7 @@ $('bkFile').onchange = async () => {
   if (cfg.h2_site) parts.push(`HTTP/2 站点（${cfg.h2_site.domain}${cfg.h2_site.cert ? '，含证书' : '，内嵌证书'}）`);
   if (cfg.dns) parts.push(`DNS 自定义解析 ${cfg.dns.length} 条`);
   if (cfg.h2_routes) parts.push(`HTTP/2 自定义接口 ${cfg.h2_routes.length} 个`);
+  if (cfg.dns_blacklist) parts.push(`DNS 黑名单 ${cfg.dns_blacklist.block.length} 条，例外 ${cfg.dns_blacklist.allow.length} 条`);
 
   if (cfg.wifi) parts.push('Wi-Fi 设置');
   if (!parts.length) { bkShowMsg('文件中没有可导入的段', false); return; }
@@ -911,6 +953,10 @@ $('bkFile').onchange = async () => {
       for (const r of cfg.h2_routes) await apiPost('/api/h2routes', { action: 'set', path: r.path, json: r.json });
       bkLog(`HTTP/2 自定义接口：已替换为 ${cfg.h2_routes.length} 个`);
     }
+    if (cfg.dns_blacklist) {
+      await apiPost('/api/dnsblock', { block: cfg.dns_blacklist.block.join('\n'), allow: cfg.dns_blacklist.allow.join('\n') });
+      bkLog(`DNS 黑名单：已替换为 ${cfg.dns_blacklist.block.length} 条，例外 ${cfg.dns_blacklist.allow.length} 条`);
+    }
     if (cfg.ignoredBlocklist) bkLog('blocklist 段已忽略（黑名单只在记录页临时设置，不再保存）');
     if (cfg.wifi) {
       const w = cfg.wifi, f = {};
@@ -926,8 +972,48 @@ $('bkFile').onchange = async () => {
   } catch (e) {
     bkShowMsg('导入中断：' + e.message + '（之前的步骤已生效）', false);
   }
-  Promise.all([siteLoad(), dnsLoad(), rtLoad(), loadConfig()]).catch(() => {});
+  Promise.all([siteLoad(), dnsLoad(), dfLoad(), rtLoad(), loadConfig()]).catch(() => {});
 };
+
+
+/* ---------- DNS 黑名单 ---------- */
+function dfShowMsg(t, ok) { const m = $('dfMsg'); m.textContent = t; m.className = ok ? 'ok' : 'bad'; }
+async function dfLoad() {
+  const d = await (await fetch('/api/dnsblock', { cache: 'no-store' })).json();
+  $('dfBlock').value = d.block.join('\n');
+  $('dfAllow').value = d.allow.join('\n');
+  $('dfCount').textContent = `（黑名单 ${d.block.length}/${d.max_block}，例外 ${d.allow.length}/${d.max_allow}）`;
+}
+$('dfForm').onsubmit = async ev => {
+  ev.preventDefault();
+  try {
+    const r = await fetch('/api/dnsblock', { method: 'POST',
+      body: new URLSearchParams({ block: $('dfBlock').value, allow: $('dfAllow').value }) });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || `请求失败（${r.status}）`);
+    dfShowMsg('已保存，立即生效', true);
+    await dfLoad();
+  } catch (e) { dfShowMsg(e.message, false); }
+};
+const DF_RESULT = {
+  blocked: r => `拦截（命中黑名单规则 ${r}）`,
+  allowed: r => `放行（命中例外 ${r}）`,
+  forward: () => '放行（未命中黑名单，转发上游）',
+  local: () => '自定义解析（本地应答，优先于黑名单）',
+  blocked_monitor: () => '拦截（记录页临时黑名单）',
+};
+$('dfTestBtn').onclick = async () => {
+  const n = $('dfTest').value.trim();
+  if (!n) return;
+  try {
+    const r = await fetch('/api/dnsblock?test=' + encodeURIComponent(n), { cache: 'no-store' });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || `请求失败（${r.status}）`);
+    $('dfTestOut').textContent = `${j.name}：${(DF_RESULT[j.result] || (() => j.result))(j.rule)}`;
+  } catch (e) { $('dfTestOut').textContent = e.message; }
+};
+$('dfTest').onkeydown = e => { if (e.key === 'Enter') $('dfTestBtn').click(); };
+dfLoad().catch(() => dfShowMsg('读取 DNS 黑名单失败', false));
 
 loadConfig().catch(() => showMsg('读取配置失败', false)).then(scan);
 

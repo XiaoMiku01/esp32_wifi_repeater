@@ -23,6 +23,7 @@
 #include "h2_routes.h"
 #include "h2_site.h"
 #include "monitor.h"
+#include "dns_filter.h"
 
 #define RECONNECT_DELAY_MS  3000
 #define APPLY_DELAY_MS      500   /* 先让 HTTP 响应发出去再动 Wi-Fi */
@@ -287,6 +288,7 @@ void app_main(void)
     repeater_cfg_load(&s_cfg);
     h2_routes_init();
     dns_relay_load_overrides();
+    dns_filter_load();
     h2_site_load();
 
     ESP_ERROR_CHECK(esp_netif_init());

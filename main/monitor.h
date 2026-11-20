@@ -30,7 +30,8 @@ void monitor_on_ip(const uint8_t mac[6], uint32_t ip, const char *hostname);
 typedef enum {
     MON_DNS_FORWARD = 0,    /* 转发上游 */
     MON_DNS_LOCAL,          /* 自定义解析，本地应答 */
-    MON_DNS_BLOCKED,        /* 黑名单，回 NXDOMAIN */
+    MON_DNS_BLOCKED,        /* 记录页临时黑名单，回 NXDOMAIN */
+    MON_DNS_FILTERED,       /* 配置页 DNS 黑名单，回 NXDOMAIN */
 } mon_dns_result_t;
 
 bool monitor_is_blocked(const char *name);
