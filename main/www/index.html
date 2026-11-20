@@ -199,6 +199,8 @@
         <label for="rtJson">应答 JSON</label>
         <textarea id="rtJson" spellcheck="false" placeholder='{"hello": "world"}' required></textarea>
         <div class="muted" id="rtSize"></div>
+        <p class="muted">匹配规则：不区分请求方法和大小写，忽略结尾斜杠和查询串；按结尾整段匹配，
+          设置 /abc 时 /abc、/a/abc、/b/abc 都会命中，多条命中时取最长的一条。</p>
         <div class="row" style="margin-top:8px">
           <button type="submit" class="primary">保存接口</button>
           <button type="button" id="rtFmt">格式化</button>
@@ -434,7 +436,7 @@ $('rtForm').onsubmit = async ev => {
   ev.preventDefault();
   let path = $('rtPath').value.trim();
   if (path && !path.startsWith('/')) path = '/' + path;
-  if (!/^\/[\x21-\x7e]{1,63}$/.test(path) || /[?#*]/.test(path)) { rtShowMsg('路径须以 / 开头，2-64 个 ASCII 可见字符，不能包含 ?、#、*', false); return; }
+  if (!/^\/\S{1,63}$/.test(path) || /[?#*]/.test(path)) { rtShowMsg('路径须以 / 开头，长度 2-64，不能包含空白、?、#、*', false); return; }
   let json;
   try { json = rtCompact(); } catch (e) { rtShowMsg(e.message, false); return; }
   if (utf8Len(json) > rtInfo.max_json) { rtShowMsg(`JSON 超过 ${rtInfo.max_json} 字节`, false); return; }

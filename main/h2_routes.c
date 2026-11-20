@@ -10,7 +10,9 @@
 #include "nvs.h"
 #include "esp_log.h"
 #include "esp_rom_md5.h"
+#include <strings.h>
 #include "h2_routes.h"
+#include "h2_server.h"
 
 #define NVS_NS  "h2routes"
 
@@ -93,6 +95,7 @@ void h2_routes_init(void)
         s_tab[i].json = malloc(jlen);
         if (s_tab[i].json && nvs_get_str(h, jk, s_tab[i].json, &jlen) == ESP_OK) {
             json_minify(s_tab[i].json);     /* 兼容旧版本存的未压缩 JSON */
+            h2_path_normalize(s_tab[i].path);
             md5_hex(s_tab[i].json, s_tab[i].md5);
             n++;
         } else {
@@ -113,12 +116,12 @@ static const char *validate(const char *path, const char *json)
     }
     for (const char *p = path; *p; p++) {
         unsigned char c = (unsigned char)*p;
-        if (c <= 0x20 || c >= 0x7f || c == '?' || c == '#' || c == '*') {
-            return "路径只能用 ASCII 可见字符，且不能包含 ?、#、*";
+        if (c <= 0x20 || c == 0x7f || c == '?' || c == '#' || c == '*') {
+            return "路径不能包含空白、?、#、*";
         }
     }
     for (size_t i = 0; i < sizeof(s_reserved) / sizeof(s_reserved[0]); i++) {
-        if (strcmp(path, s_reserved[i]) == 0) {
+        if (strcasecmp(path, s_reserved[i]) == 0) {
             return "该路径为内置接口，不能覆盖";
         }
     }
@@ -129,8 +132,25 @@ static const char *validate(const char *path, const char *json)
     return NULL;
 }
 
-esp_err_t h2_routes_set(const char *path, const char *json_in, const char **err_msg)
+/* 与 h2_server 路由相同的规则规范化：百分号解码、合并斜杠、去结尾斜杠；
+ * 比较时不区分大小写 */
+static bool norm_path(const char *in, char *out, size_t cap)
 {
+    if (strlen(in) >= cap) {
+        return false;
+    }
+    strcpy(out, in);
+    h2_path_normalize(out);
+    return true;
+}
+
+esp_err_t h2_routes_set(const char *path_in, const char *json_in, const char **err_msg)
+{
+    char path[H2_ROUTE_PATH_MAX * 3 + 1];
+    if (!norm_path(path_in, path, sizeof(path))) {
+        *err_msg = "路径须以 / 开头，长度 2-64";
+        return ESP_ERR_INVALID_ARG;
+    }
     char *copy = strdup(json_in);
     if (!copy) {
         *err_msg = "内存不足";
@@ -148,7 +168,7 @@ esp_err_t h2_routes_set(const char *path, const char *json_in, const char **err_
     xSemaphoreTake(s_lock, portMAX_DELAY);
     int slot = -1, free_slot = -1;
     for (int i = 0; i < H2_ROUTES_MAX; i++) {
-        if (s_tab[i].json && strcmp(s_tab[i].path, path) == 0) {
+        if (s_tab[i].json && strcasecmp(s_tab[i].path, path) == 0) {
             slot = i;
             break;
         }
@@ -191,12 +211,16 @@ esp_err_t h2_routes_set(const char *path, const char *json_in, const char **err_
     return err;
 }
 
-esp_err_t h2_routes_del(const char *path)
+esp_err_t h2_routes_del(const char *path_in)
 {
+    char path[H2_ROUTE_PATH_MAX * 3 + 1];
+    if (!norm_path(path_in, path, sizeof(path))) {
+        return ESP_ERR_NOT_FOUND;
+    }
     esp_err_t err = ESP_ERR_NOT_FOUND;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     for (int i = 0; i < H2_ROUTES_MAX; i++) {
-        if (s_tab[i].json && strcmp(s_tab[i].path, path) == 0) {
+        if (s_tab[i].json && strcasecmp(s_tab[i].path, path) == 0) {
             nvs_handle_t h;
             char pk[8], jk[8];
             key_names(i, pk, jk);
@@ -218,19 +242,30 @@ esp_err_t h2_routes_del(const char *path)
     return err;
 }
 
+/* 后缀匹配：配置路径是请求路径的结尾（按整段匹配）即命中。
+ * 配置路径以 '/' 开头，所以尾部比较天然落在段边界上：/abc 命中 /abc、/a/abc，不命中 /xabc。
+ * 多条命中时取最长（最具体）的一条，因此完全相同的路径优先 */
 bool h2_routes_with(const char *path, void (*fn)(const char *json, const char *md5, void *arg), void *arg)
 {
-    bool found = false;
+    size_t rlen = strlen(path);
+    int best = -1;
+    size_t best_len = 0;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     for (int i = 0; i < H2_ROUTES_MAX; i++) {
-        if (s_tab[i].json && strcmp(s_tab[i].path, path) == 0) {
-            fn(s_tab[i].json, s_tab[i].md5, arg);
-            found = true;
-            break;
+        if (!s_tab[i].json) {
+            continue;
+        }
+        size_t plen = strlen(s_tab[i].path);
+        if (plen <= rlen && plen > best_len && strcasecmp(path + rlen - plen, s_tab[i].path) == 0) {
+            best = i;
+            best_len = plen;
         }
     }
+    if (best >= 0) {
+        fn(s_tab[best].json, s_tab[best].md5, arg);
+    }
     xSemaphoreGive(s_lock);
-    return found;
+    return best >= 0;
 }
 
 void h2_routes_foreach(void (*fn)(const char *path, const char *json, void *arg), void *arg)

@@ -130,14 +130,56 @@ static void req_free(h2_req_t *req)
     free(req);
 }
 
+static int hexval(char ch)
+{
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
+void h2_path_normalize(char *p)
+{
+    /* 1. 百分号解码；非法序列和 %00 保留原样 */
+    char *r = p, *w = p;
+    while (*r) {
+        if (r[0] == '%' && hexval(r[1]) >= 0 && hexval(r[2]) >= 0) {
+            int v = hexval(r[1]) * 16 + hexval(r[2]);
+            if (v) {
+                *w++ = (char)v;
+                r += 3;
+                continue;
+            }
+        }
+        *w++ = *r++;
+    }
+    *w = '\0';
+    /* 2. 合并连续斜杠 */
+    r = w = p;
+    while (*r) {
+        if (*r == '/' && w > p && w[-1] == '/') {
+            r++;
+            continue;
+        }
+        *w++ = *r++;
+    }
+    *w = '\0';
+    /* 3. 去掉结尾斜杠（根路径除外） */
+    size_t n = w - p;
+    while (n > 1 && p[n - 1] == '/') {
+        p[--n] = '\0';
+    }
+}
+
+/* 路径已规范化，按不区分大小写比较 */
 static bool route_match(const h2_route_t *r, const char *method, const char *path, bool *path_hit)
 {
     size_t plen = strlen(r->path);
     bool hit;
     if (plen && r->path[plen - 1] == '*') {
-        hit = strncmp(path, r->path, plen - 1) == 0;
+        hit = strncasecmp(path, r->path, plen - 1) == 0;
     } else {
-        hit = strcmp(path, r->path) == 0;
+        hit = strcasecmp(path, r->path) == 0;
     }
     if (!hit) {
         return false;
@@ -391,6 +433,7 @@ static void dispatch(h2_conn_t *c, h2_req_t *req)
         }
         return;
     }
+    h2_path_normalize(req->path);   /* 路由前统一规范化，h2_req_path() 返回规范化后的路径 */
     if (req->body_too_large) {
         h2_resp_sendstr(req, 413, "text/plain", "request body too large\n");
         return;

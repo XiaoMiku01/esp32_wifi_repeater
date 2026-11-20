@@ -82,9 +82,13 @@ esp_err_t h2_server_set_cert(h2_server_handle_t srv, const uint8_t *cert_pem, si
 /* 停止接受新连接；已有连接在当前请求处理完或空闲超时后退出 */
 void h2_server_stop(h2_server_handle_t srv);
 
+/* 路径规范化（原地）：百分号解码、合并连续斜杠、去掉结尾斜杠。
+ * 路由前会对请求路径做此处理，路由匹配不区分大小写 */
+void h2_path_normalize(char *path);
+
 /* ---- 请求 ---- */
 const char *h2_req_method(const h2_req_t *req);
-const char *h2_req_path(const h2_req_t *req);    /* 不含查询串 */
+const char *h2_req_path(const h2_req_t *req);    /* 不含查询串，已规范化 */
 const char *h2_req_query(const h2_req_t *req);   /* '?' 之后部分，没有则为 "" */
 const char *h2_req_authority(const h2_req_t *req);
 int32_t h2_req_stream_id(const h2_req_t *req);  /* HTTP/1.1 请求为 0 */
