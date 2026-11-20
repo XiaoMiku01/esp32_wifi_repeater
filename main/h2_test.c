@@ -1,5 +1,6 @@
 /*
- * HTTP/2 站点（端口 443，TLS，证书为 main/certs2/ 下 H2_SITE_DOMAIN 的证书链）
+ * HTTP/2 站点（端口 443，TLS）。域名、证书链、私钥由 h2_site 提供：
+ * 默认为内嵌的 main/certs2/ 证书，可在配置页修改
  * 下游客户端经 DNS 中继把该域名解析到 192.168.4.1
  *   GET  /          说明页
  *   GET  /ping      连通性 + 协议信息
@@ -16,13 +17,9 @@
 #include "h2_server.h"
 #include "repeater.h"
 #include "h2_routes.h"
+#include "h2_site.h"
 
 static const char *TAG = "h2_test";
-
-extern const uint8_t h2_cert_start[] asm("_binary_www_aabbcc_com_fullchain_pem_start");
-extern const uint8_t h2_cert_end[]   asm("_binary_www_aabbcc_com_fullchain_pem_end");
-extern const uint8_t h2_key_start[]  asm("_binary_www_aabbcc_com_key_start");
-extern const uint8_t h2_key_end[]    asm("_binary_www_aabbcc_com_key_end");
 
 static esp_err_t index_get(h2_req_t *req)
 {
@@ -116,10 +113,7 @@ esp_err_t h2_test_start(void)
 {
     h2_server_config_t cfg = H2_SERVER_DEFAULT_CONFIG();
     cfg.port = H2_SITE_PORT;
-    cfg.cert_pem = h2_cert_start;
-    cfg.cert_len = h2_cert_end - h2_cert_start;
-    cfg.key_pem = h2_key_start;
-    cfg.key_len = h2_key_end - h2_key_start;
+    h2_site_get_cert(&cfg.cert_pem, &cfg.cert_len, &cfg.key_pem, &cfg.key_len);
 
     h2_server_handle_t srv;
     esp_err_t err = h2_server_start(&cfg, &srv);
@@ -127,7 +121,10 @@ esp_err_t h2_test_start(void)
         ESP_LOGE(TAG, "HTTP/2 站点启动失败: %s", esp_err_to_name(err));
         return err;
     }
-    ESP_LOGI(TAG, "HTTP/2 站点 https://%s/ （端口 %d）", H2_SITE_DOMAIN, H2_SITE_PORT);
+    h2_site_set_server(srv);
+    char domain[64];
+    h2_site_get_domain(domain, sizeof(domain));
+    ESP_LOGI(TAG, "HTTP/2 站点 https://%s/ （端口 %d）", domain, H2_SITE_PORT);
     const h2_route_t routes[] = {
         { "GET",  "/",        index_get,   NULL },
         { "GET",  "/ping",    ping_get,    NULL },

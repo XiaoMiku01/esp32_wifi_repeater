@@ -83,7 +83,15 @@
   #rtList .j { flex:1; min-width:0; color:var(--muted); font-size:12px; overflow:hidden;
                text-overflow:ellipsis; white-space:nowrap; font-family:ui-monospace,Menlo,Consolas,monospace; }
   #rtList button { padding:3px 8px; font-size:12px; }
-  #rtMsg.ok, #dnsMsg.ok { color:var(--ok); } #rtMsg.bad, #dnsMsg.bad { color:var(--bad); }
+  #rtMsg.ok, #dnsMsg.ok, #siteMsg.ok { color:var(--ok); }
+  #rtMsg.bad, #dnsMsg.bad, #siteMsg.bad { color:var(--bad); }
+  #siteMsg.warn { color:#d97706; }
+  .pem { min-height:90px; }
+  .file-row { display:flex; justify-content:space-between; align-items:center; margin:6px 0 2px; }
+  .file-row label { margin:0; }
+  .file-row input[type=file] { font-size:12px; max-width:60%; }
+  .tag { display:inline-block; padding:0 6px; border-radius:3px; font-size:11px; border:1px solid var(--line); }
+  .tag.ok { color:var(--ok); border-color:var(--ok); } .tag.bad { color:var(--bad); border-color:var(--bad); }
   #dnsList { list-style:none; margin:0 0 10px; padding:0; border:1px solid var(--line); border-radius:4px; }
   #dnsList:empty { display:none; }
   #dnsList li { display:flex; align-items:center; gap:8px; padding:6px 8px; border-bottom:1px solid var(--line); }
@@ -149,6 +157,34 @@
         </div>
         <div id="msg"></div>
         <p class="muted">修改本机热点后，已连接的设备会断开，需要用新 SSID/密码重新连接。</p>
+      </form>
+    </section>
+
+    <section class="card">
+      <h2>HTTP/2 站点</h2>
+      <div class="stat" id="siteInfo">
+        <span>域名</span><span id="siDomain">-</span>
+        <span>证书来源</span><span id="siSrc">-</span>
+        <span>主题</span><span id="siSubj" style="word-break:break-all">-</span>
+        <span>签发者</span><span id="siIss" style="word-break:break-all">-</span>
+        <span>有效期</span><span id="siValid">-</span>
+        <span>SAN</span><span id="siSan" style="word-break:break-all">-</span>
+      </div>
+      <form id="siteForm" autocomplete="off" style="margin-top:10px">
+        <label for="siteDomain">域名</label>
+        <input type="text" id="siteDomain" maxlength="63" required>
+        <div class="file-row"><label for="siteCert">证书链（PEM，含中间证书）</label>
+          <input type="file" id="siteCertFile" accept=".pem,.crt,.cer,.txt"></div>
+        <textarea id="siteCert" class="pem" spellcheck="false" placeholder="留空表示沿用当前证书"></textarea>
+        <div class="file-row"><label for="siteKey">私钥（PEM，未加密）</label>
+          <input type="file" id="siteKeyFile" accept=".pem,.key,.txt"></div>
+        <textarea id="siteKey" class="pem" spellcheck="false" placeholder="留空表示沿用当前私钥"></textarea>
+        <div class="row" style="margin-top:8px">
+          <button type="submit" class="primary">保存站点</button>
+          <button type="button" id="siteReset">恢复内嵌证书</button>
+        </div>
+        <div id="siteMsg"></div>
+        <p class="muted">新证书只对之后的新连接生效。修改域名时，DNS 自定义解析中的旧域名条目会自动改为新域名。</p>
       </form>
     </section>
 
@@ -460,6 +496,66 @@ $('dnsForm').onsubmit = async ev => {
   } catch (err) { dnsShowMsg(err.message, false); }
 };
 dnsLoad().catch(() => dnsShowMsg('读取自定义解析失败', false));
+
+
+/* ---------- HTTP/2 站点：域名与证书 ---------- */
+function siteShowMsg(t, cls) { const m = $('siteMsg'); m.textContent = t; m.className = cls; }
+async function siteLoad() {
+  const i = await (await fetch('/api/h2site', { cache: 'no-store' })).json();
+  $('siDomain').textContent = i.domain + (i.domain_source === 'web' ? '（网页配置）' : '（默认）');
+  $('siDomain').appendChild(document.createTextNode(' '));
+  const tag = document.createElement('span');
+  tag.className = 'tag ' + (i.domain_match ? 'ok' : 'bad');
+  tag.textContent = i.domain_match ? '证书匹配' : '证书不含此域名';
+  $('siDomain').appendChild(tag);
+  $('siSrc').textContent = i.cert_source === 'web' ? '网页上传' : '固件内嵌';
+  $('siSubj').textContent = i.subject || '-';
+  $('siIss').textContent = i.issuer || '-';
+  $('siValid').textContent = i.cert_ok ? `${i.not_before} 至 ${i.not_after}（UTC）` : '证书无法解析';
+  $('siSan').textContent = i.san.length ? i.san.join(', ') : '-';
+  if (!$('siteDomain').value) $('siteDomain').value = i.domain;
+}
+function bindFile(fileId, areaId) {
+  $(fileId).onchange = async () => {
+    const f = $(fileId).files[0];
+    if (f) $(areaId).value = await f.text();
+  };
+}
+bindFile('siteCertFile', 'siteCert');
+bindFile('siteKeyFile', 'siteKey');
+$('siteForm').onsubmit = async ev => {
+  ev.preventDefault();
+  const domain = $('siteDomain').value.trim().toLowerCase().replace(/\.$/, '');
+  const cert = $('siteCert').value.trim(), key = $('siteKey').value.trim();
+  if (!!cert !== !!key) { siteShowMsg('证书和私钥须同时提供；只改域名时两者都留空', 'bad'); return; }
+  if (cert && !cert.includes('-----BEGIN CERTIFICATE-----')) { siteShowMsg('证书须为 PEM 格式（-----BEGIN CERTIFICATE-----）', 'bad'); return; }
+  if (key && !/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(key)) { siteShowMsg('私钥须为 PEM 格式（-----BEGIN ... PRIVATE KEY-----）', 'bad'); return; }
+  siteShowMsg('保存中…', 'ok');
+  try {
+    const r = await fetch('/api/h2site', { method: 'POST',
+      body: new URLSearchParams({ action: 'set', domain, cert: cert ? cert + '\n' : '', key: key ? key + '\n' : '' }) });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || `请求失败（${r.status}）`);
+    $('siteCert').value = ''; $('siteKey').value = '';
+    $('siteCertFile').value = ''; $('siteKeyFile').value = '';
+    if (j.warning) siteShowMsg('已保存。注意：' + j.warning, 'warn');
+    else siteShowMsg('已保存' + (cert ? '，新证书对之后的新连接生效' : ''), 'ok');
+    $('siteDomain').value = '';
+    await Promise.all([siteLoad(), dnsLoad(), rtLoad()]);
+  } catch (e) { siteShowMsg(e.message, 'bad'); }
+};
+$('siteReset').onclick = async () => {
+  if (!confirm('清除网页配置的域名和证书，恢复固件内嵌的证书？')) return;
+  try {
+    const r = await fetch('/api/h2site', { method: 'POST', body: new URLSearchParams({ action: 'reset' }) });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || `请求失败（${r.status}）`);
+    siteShowMsg('已恢复内嵌证书', 'ok');
+    $('siteDomain').value = '';
+    await Promise.all([siteLoad(), dnsLoad(), rtLoad()]);
+  } catch (e) { siteShowMsg(e.message, 'bad'); }
+};
+siteLoad().catch(() => siteShowMsg('读取站点信息失败', 'bad'));
 
 loadConfig().catch(() => showMsg('读取配置失败', false)).then(scan);
 

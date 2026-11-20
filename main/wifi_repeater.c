@@ -21,6 +21,7 @@
 #include "nvs_flash.h"
 #include "repeater.h"
 #include "h2_routes.h"
+#include "h2_site.h"
 
 #define RECONNECT_DELAY_MS  3000
 #define APPLY_DELAY_MS      500   /* 先让 HTTP 响应发出去再动 Wi-Fi */
@@ -282,6 +283,7 @@ void app_main(void)
     repeater_cfg_load(&s_cfg);
     h2_routes_init();
     dns_relay_load_overrides();
+    h2_site_load();
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());

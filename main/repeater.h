@@ -57,6 +57,7 @@ void dns_relay_start(esp_netif_t *ap, esp_netif_t *sta);
 void dns_relay_load_overrides(void);    /* NVS 初始化之后、dns_relay_start 之前调用 */
 esp_err_t dns_relay_set_override(const char *name, uint32_t ip, const char **err_msg);
 esp_err_t dns_relay_del_override(const char *name);
+bool dns_relay_get_override(const char *name, uint32_t *ip);
 void dns_relay_foreach_override(void (*fn)(const char *name, uint32_t ip, void *arg), void *arg);
 
 /* Web 服务（web_server.c） */
@@ -64,6 +65,7 @@ esp_err_t web_server_start(void);
 
 /* HTTP/2 站点（h2_test.c）：端口 443，证书为 main/certs2/ 下的该域名证书，
  * DNS 中继把该域名解析到 AP 地址 */
-#define H2_SITE_DOMAIN  "www.aabbcc.com"
+/* 默认域名；运行时域名可在配置页修改，见 h2_site.h */
+#define H2_SITE_DEFAULT_DOMAIN  "www.aabbcc.com"
 #define H2_SITE_PORT    443
 esp_err_t h2_test_start(void);

@@ -7,7 +7,7 @@
  *
  * 自定义解析：表中的域名不转发，直接应答指定 IPv4（A 记录；AAAA 等其他类型
  * 回空应答，让客户端回落到 IPv4）；不在表中的域名照常转发上游。
- * 表存 NVS（命名空间 dnsovr），可在配置页增删；首次启动预置 H2_SITE_DOMAIN -> AP 地址。
+ * 表存 NVS（命名空间 dnsovr），可在配置页增删；首次启动预置 H2_SITE_DEFAULT_DOMAIN -> AP 地址。
  */
 #include <string.h>
 #include <ctype.h>
@@ -235,10 +235,10 @@ void dns_relay_load_overrides(void)
         ESP_LOGI(TAG, "已加载 %d 条自定义解析", s_n_ovr);
     } else {
         /* 首次启动：预置 h2 站点域名解析到 AP */
-        strlcpy(s_ovr[0].name, H2_SITE_DOMAIN, sizeof(s_ovr[0].name));
+        strlcpy(s_ovr[0].name, H2_SITE_DEFAULT_DOMAIN, sizeof(s_ovr[0].name));
         s_ovr[0].ip = 0;
         s_n_ovr = 1;
-        ESP_LOGI(TAG, "无自定义解析配置，预置 %s -> AP", H2_SITE_DOMAIN);
+        ESP_LOGI(TAG, "无自定义解析配置，预置 %s -> AP", H2_SITE_DEFAULT_DOMAIN);
     }
 }
 
@@ -301,6 +301,12 @@ esp_err_t dns_relay_del_override(const char *name)
     }
     xSemaphoreGive(s_ovr_lock);
     return err;
+}
+
+bool dns_relay_get_override(const char *name, uint32_t *ip)
+{
+    char norm[DNS_OVR_NAME_MAX + 1];
+    return normalize_name(name, norm) == NULL && lookup_override(norm, ip);
 }
 
 void dns_relay_foreach_override(void (*fn)(const char *name, uint32_t ip, void *arg), void *arg)

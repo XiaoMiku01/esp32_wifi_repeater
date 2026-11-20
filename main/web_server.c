@@ -11,6 +11,9 @@
  *   GET  /api/dns      自定义 DNS 解析列表
  *   POST /api/dns      新增/修改（action=set&name=&ip=，ip 留空或 ap 表示 AP 地址）
  *                      或删除（action=del&name=）
+ *   GET  /api/h2site   HTTP/2 站点域名与证书信息（不含私钥）
+ *   POST /api/h2site   修改（action=set&domain=&cert=&key=，cert/key 同时为空表示只改域名）
+ *                      或恢复内嵌（action=reset）
  *   GET  /ws           WebSocket，推送实时日志（二进制帧，UTF-8 文本）
  */
 #include <string.h>
@@ -25,6 +28,7 @@
 #include "repeater.h"
 #include "web_log_priv.h"
 #include "h2_routes.h"
+#include "h2_site.h"
 #include "lwip/inet.h"
 
 static const char *TAG = "web";
@@ -372,10 +376,11 @@ static void route_chunk(const char *path, const char *json, void *arg)
 
 static esp_err_t h2routes_get(httpd_req_t *req)
 {
-    char head[160];
+    char head[160], domain[64];
+    h2_site_get_domain(domain, sizeof(domain));
     snprintf(head, sizeof(head),
              "{\"domain\":\"%s\",\"port\":%d,\"max\":%d,\"max_json\":%d,\"routes\":[",
-             H2_SITE_DOMAIN, H2_SITE_PORT, H2_ROUTES_MAX, H2_ROUTE_JSON_MAX);
+             domain, H2_SITE_PORT, H2_ROUTES_MAX, H2_ROUTE_JSON_MAX);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr_chunk(req, head);
     route_list_ctx_t ctx = { .req = req };
@@ -553,10 +558,90 @@ static esp_err_t dns_post(httpd_req_t *req)
     return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
+/* ---------- HTTP/2 站点：域名与证书 ---------- */
+
+static esp_err_t h2site_get(httpd_req_t *req)
+{
+    char *buf = malloc(2048);
+    if (!buf) {
+        return send_json_error(req, "500 Internal Server Error", "内存不足");
+    }
+    int n = h2_site_info_json(buf, 2048);
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t ret = httpd_resp_send(req, buf, n < 2048 ? n : 2047);
+    free(buf);
+    return ret;
+}
+
+static esp_err_t h2site_post(httpd_req_t *req)
+{
+    const size_t max = (H2_SITE_CERT_MAX + H2_SITE_KEY_MAX) * 3 + 256;
+    if (req->content_len == 0 || req->content_len > max) {
+        return send_json_error(req, "413 Payload Too Large", "请求过大（证书不超过 8KB，私钥不超过 4KB）");
+    }
+    char *body = malloc(req->content_len + 1);
+    if (!body) {
+        return send_json_error(req, "500 Internal Server Error", "内存不足");
+    }
+    size_t got = 0;
+    while (got < req->content_len) {
+        int r = httpd_req_recv(req, body + got, req->content_len - got);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+            continue;
+        }
+        if (r <= 0) {
+            free(body);
+            return ESP_FAIL;
+        }
+        got += r;
+    }
+    body[got] = '\0';
+
+    char *action = form_get_alloc(body, "action");
+    char *domain = form_get_alloc(body, "domain");
+    char *cert = form_get_alloc(body, "cert");
+    char *key = form_get_alloc(body, "key");
+    /* 请求体含私钥，尽快清零释放 */
+    memset(body, 0, got);
+    free(body);
+
+    esp_err_t ret;
+    if (action && strcmp(action, "reset") == 0) {
+        if (h2_site_reset() == ESP_OK) {
+            httpd_resp_set_type(req, "application/json");
+            ret = httpd_resp_sendstr(req, "{\"ok\":true}");
+        } else {
+            ret = send_json_error(req, "500 Internal Server Error", "清除 NVS 失败");
+        }
+    } else if (action && strcmp(action, "set") == 0) {
+        const char *msg = NULL;
+        char warn[160];
+        if (h2_site_update(domain, cert, key, &msg, warn, sizeof(warn)) != ESP_OK) {
+            ret = send_json_error(req, "400 Bad Request", msg ? msg : "保存失败");
+        } else {
+            char resp[240], esc[200];
+            json_str(esc, sizeof(esc), warn);
+            snprintf(resp, sizeof(resp), "{\"ok\":true,\"warning\":%s}", esc);
+            httpd_resp_set_type(req, "application/json");
+            ret = httpd_resp_sendstr(req, resp);
+        }
+    } else {
+        ret = send_json_error(req, "400 Bad Request", "action 须为 set 或 reset");
+    }
+    free(action);
+    free(domain);
+    free(cert);
+    if (key) {
+        memset(key, 0, strlen(key));
+        free(key);
+    }
+    return ret;
+}
+
 esp_err_t web_server_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 16;
+    cfg.max_uri_handlers = 18;
     cfg.lru_purge_enable = true;
     cfg.stack_size = 6144;
 
@@ -578,6 +663,8 @@ esp_err_t web_server_start(void)
         { .uri = "/api/h2routes", .method = HTTP_POST, .handler = h2routes_post },
         { .uri = "/api/dns",      .method = HTTP_GET,  .handler = dns_get },
         { .uri = "/api/dns",      .method = HTTP_POST, .handler = dns_post },
+        { .uri = "/api/h2site",   .method = HTTP_GET,  .handler = h2site_get },
+        { .uri = "/api/h2site",   .method = HTTP_POST, .handler = h2site_post },
         { .uri = "/ws",          .method = HTTP_GET,  .handler = ws_handler, .is_websocket = true,
           .ws_post_handshake_cb = ws_post_handshake },
     };

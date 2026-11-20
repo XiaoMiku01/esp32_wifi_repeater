@@ -33,13 +33,25 @@ typedef struct h2_hdr {
     char *value;
 } h2_hdr_t;
 
+/* 服务器证书与私钥。握手时取一个引用，握手结束即释放（mbedTLS 解析时已复制）；
+ * 替换证书后，旧证书在最后一个握手结束时释放 */
+typedef struct {
+    int refs;
+    bool owned;             /* true：缓冲区由本模块分配 */
+    const uint8_t *cert;
+    size_t cert_len;
+    const uint8_t *key;
+    size_t key_len;
+} cert_bundle_t;
+
 struct h2_server {
     h2_server_config_t cfg;
-    esp_tls_cfg_server_t tls_cfg;
+    esp_tls_cfg_server_t tls_cfg;   /* 模板；证书字段在每次握手时填入 */
+    cert_bundle_t *cert;            /* 受 lock 保护 */
     int listen_fd;
     volatile bool stopping;
     SemaphoreHandle_t conn_sem;
-    SemaphoreHandle_t lock;         /* 保护路由表 */
+    SemaphoreHandle_t lock;         /* 保护路由表和证书 */
     h2_route_t *routes;
     uint8_t n_routes;
 };
@@ -511,6 +523,76 @@ out:
     c->ng = NULL;
 }
 
+static void bundle_unref_locked(cert_bundle_t *b)
+{
+    if (--b->refs == 0) {
+        if (b->owned) {
+            free((void *)b->cert);
+            free((void *)b->key);
+        }
+        free(b);
+    }
+}
+
+static cert_bundle_t *bundle_acquire(h2_server_handle_t srv)
+{
+    xSemaphoreTake(srv->lock, portMAX_DELAY);
+    cert_bundle_t *b = srv->cert;
+    b->refs++;
+    xSemaphoreGive(srv->lock);
+    return b;
+}
+
+static void bundle_release(h2_server_handle_t srv, cert_bundle_t *b)
+{
+    xSemaphoreTake(srv->lock, portMAX_DELAY);
+    bundle_unref_locked(b);
+    xSemaphoreGive(srv->lock);
+}
+
+/* 复制 PEM，保证以 '\0' 结尾（mbedTLS 解析 PEM 要求长度含结尾 0） */
+static uint8_t *pem_dup(const uint8_t *src, size_t len, size_t *out_len)
+{
+    bool has_nul = len && src[len - 1] == '\0';
+    size_t n = has_nul ? len : len + 1;
+    uint8_t *d = malloc(n);
+    if (d) {
+        memcpy(d, src, len);
+        d[n - 1] = '\0';
+        *out_len = n;
+    }
+    return d;
+}
+
+esp_err_t h2_server_set_cert(h2_server_handle_t srv, const uint8_t *cert_pem, size_t cert_len,
+                             const uint8_t *key_pem, size_t key_len)
+{
+    if (!srv || !cert_pem || !cert_len || !key_pem || !key_len) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    cert_bundle_t *b = calloc(1, sizeof(*b));
+    if (!b) {
+        return ESP_ERR_NO_MEM;
+    }
+    b->refs = 1;
+    b->owned = true;
+    b->cert = pem_dup(cert_pem, cert_len, &b->cert_len);
+    b->key = pem_dup(key_pem, key_len, &b->key_len);
+    if (!b->cert || !b->key) {
+        free((void *)b->cert);
+        free((void *)b->key);
+        free(b);
+        return ESP_ERR_NO_MEM;
+    }
+    xSemaphoreTake(srv->lock, portMAX_DELAY);
+    cert_bundle_t *old = srv->cert;
+    srv->cert = b;
+    bundle_unref_locked(old);
+    xSemaphoreGive(srv->lock);
+    ESP_LOGI(TAG, "服务器证书已更新，新连接生效");
+    return ESP_OK;
+}
+
 static void conn_task(void *arg)
 {
     h2_conn_t *c = arg;
@@ -527,7 +609,15 @@ static void conn_task(void *arg)
     if (!c->tls) {
         goto done;
     }
-    int ret = esp_tls_server_session_create(&srv->tls_cfg, c->fd, c->tls);
+    /* tls_cfg 在整个连接期间保持有效（esp-tls 可能保留其指针） */
+    esp_tls_cfg_server_t tls_cfg = srv->tls_cfg;
+    cert_bundle_t *cb = bundle_acquire(srv);
+    tls_cfg.servercert_buf = cb->cert;
+    tls_cfg.servercert_bytes = cb->cert_len;
+    tls_cfg.serverkey_buf = cb->key;
+    tls_cfg.serverkey_bytes = cb->key_len;
+    int ret = esp_tls_server_session_create(&tls_cfg, c->fd, c->tls);
+    bundle_release(srv, cb);    /* 证书已被 mbedTLS 解析复制 */
     if (ret != 0) {
         ESP_LOGW(TAG, "%s TLS 握手失败: -0x%04x", c->peer, -ret);
         goto done;
@@ -620,10 +710,15 @@ esp_err_t h2_server_start(const h2_server_config_t *cfg, h2_server_handle_t *out
     }
 
     srv->tls_cfg.alpn_protos = s_alpn;
-    srv->tls_cfg.servercert_buf = cfg->cert_pem;
-    srv->tls_cfg.servercert_bytes = cfg->cert_len;
-    srv->tls_cfg.serverkey_buf = cfg->key_pem;
-    srv->tls_cfg.serverkey_bytes = cfg->key_len;
+    srv->cert = calloc(1, sizeof(cert_bundle_t));
+    if (!srv->cert) {
+        goto fail_mem;
+    }
+    *srv->cert = (cert_bundle_t) {
+        .refs = 1, .owned = false,
+        .cert = cfg->cert_pem, .cert_len = cfg->cert_len,
+        .key = cfg->key_pem, .key_len = cfg->key_len,
+    };
 
     /* 客户端证书：IGNORE 时不设 CA，esp-tls 不发 CertificateRequest，客户端不会出示证书 */
     switch (cfg->client_auth) {
@@ -680,6 +775,7 @@ fail_arg:
     if (srv->conn_sem) vSemaphoreDelete(srv->conn_sem);
     if (srv->lock) vSemaphoreDelete(srv->lock);
     free(srv->routes);
+    free(srv->cert);
     free(srv);
     return ESP_ERR_INVALID_ARG;
 
@@ -687,6 +783,7 @@ fail_mem:
     if (srv->conn_sem) vSemaphoreDelete(srv->conn_sem);
     if (srv->lock) vSemaphoreDelete(srv->lock);
     free(srv->routes);
+    free(srv->cert);
     free(srv);
     return ESP_FAIL;
 }

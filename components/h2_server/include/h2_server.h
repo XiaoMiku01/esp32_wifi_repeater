@@ -74,6 +74,10 @@ typedef struct {
 /* 启动监听。证书/私钥缓冲区须在服务运行期间保持有效 */
 esp_err_t h2_server_start(const h2_server_config_t *cfg, h2_server_handle_t *out);
 esp_err_t h2_server_register(h2_server_handle_t srv, const h2_route_t *route);
+/* 替换服务器证书链和私钥（PEM，内部复制）。只影响之后的新连接，已建立的连接不受影响。
+ * 调用方应先校验证书与私钥配对，否则新连接握手会失败 */
+esp_err_t h2_server_set_cert(h2_server_handle_t srv, const uint8_t *cert_pem, size_t cert_len,
+                             const uint8_t *key_pem, size_t key_len);
 /* 停止接受新连接；已有连接在当前请求处理完或空闲超时后退出 */
 void h2_server_stop(h2_server_handle_t srv);
 
