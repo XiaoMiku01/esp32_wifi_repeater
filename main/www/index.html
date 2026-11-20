@@ -83,7 +83,15 @@
   #rtList .j { flex:1; min-width:0; color:var(--muted); font-size:12px; overflow:hidden;
                text-overflow:ellipsis; white-space:nowrap; font-family:ui-monospace,Menlo,Consolas,monospace; }
   #rtList button { padding:3px 8px; font-size:12px; }
-  #rtMsg.ok { color:var(--ok); } #rtMsg.bad { color:var(--bad); }
+  #rtMsg.ok, #dnsMsg.ok { color:var(--ok); } #rtMsg.bad, #dnsMsg.bad { color:var(--bad); }
+  #dnsList { list-style:none; margin:0 0 10px; padding:0; border:1px solid var(--line); border-radius:4px; }
+  #dnsList:empty { display:none; }
+  #dnsList li { display:flex; align-items:center; gap:8px; padding:6px 8px; border-bottom:1px solid var(--line); }
+  #dnsList li:last-child { border-bottom:none; }
+  #dnsList .n { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+                font-family:ui-monospace,Menlo,Consolas,monospace; }
+  #dnsList .i { color:var(--muted); font-size:12px; white-space:nowrap; font-family:ui-monospace,Menlo,Consolas,monospace; }
+  #dnsList button { padding:3px 8px; font-size:12px; }
 </style>
 </head>
 <body>
@@ -161,6 +169,23 @@
           <button type="button" id="rtNew">清空</button>
         </div>
         <div id="rtMsg"></div>
+      </form>
+    </section>
+
+    <section class="card">
+      <h2>DNS 自定义解析 <span class="muted" id="dnsCount"></span></h2>
+      <p class="muted">列表中的域名由本机直接应答；未配置的域名照常转发到上游 DNS。仅对连接本机热点的设备生效。</p>
+      <ul id="dnsList"></ul>
+      <form id="dnsForm" autocomplete="off">
+        <label for="dnsName">域名</label>
+        <input type="text" id="dnsName" maxlength="63" placeholder="www.example.com" required>
+        <label for="dnsIp">IPv4 地址</label>
+        <input type="text" id="dnsIp" maxlength="15" placeholder="留空 = 本机 AP 地址">
+        <div class="row" style="margin-top:8px">
+          <button type="submit" class="primary">保存解析</button>
+          <button type="button" id="dnsNew">清空</button>
+        </div>
+        <div id="dnsMsg"></div>
       </form>
     </section>
   </div>
@@ -385,6 +410,56 @@ $('rtForm').onsubmit = async ev => {
   } catch (e) { rtShowMsg(e.message, false); }
 };
 rtLoad().catch(() => rtShowMsg('读取自定义接口失败', false));
+
+
+/* ---------- DNS 自定义解析 ---------- */
+let dnsInfo = { max: 16, ap_ip: '192.168.4.1', entries: [] };
+function dnsShowMsg(t, ok) { const m = $('dnsMsg'); m.textContent = t; m.className = ok ? 'ok' : 'bad'; }
+async function dnsPost(fields) {
+  const r = await fetch('/api/dns', { method: 'POST', body: new URLSearchParams(fields) });
+  let j = {};
+  try { j = await r.json(); } catch (e) {}
+  if (!r.ok || !j.ok) throw new Error(j.error || `请求失败（${r.status}）`);
+}
+function dnsRender() {
+  const ul = $('dnsList'); ul.textContent = '';
+  $('dnsCount').textContent = `（${dnsInfo.entries.length}/${dnsInfo.max}）`;
+  for (const e of dnsInfo.entries) {
+    const li = document.createElement('li');
+    const n = document.createElement('span'); n.className = 'n'; n.textContent = e.name;
+    const i = document.createElement('span'); i.className = 'i';
+    i.textContent = e.ip === 'ap' ? `${dnsInfo.ap_ip}（AP）` : e.ip;
+    const ed = document.createElement('button'); ed.type = 'button'; ed.textContent = '编辑';
+    ed.onclick = () => { $('dnsName').value = e.name; $('dnsIp').value = e.ip === 'ap' ? '' : e.ip; dnsShowMsg('', true); };
+    const del = document.createElement('button'); del.type = 'button'; del.textContent = '删除';
+    del.onclick = async () => {
+      if (!confirm(`删除 ${e.name} 的自定义解析？删除后该域名转发到上游。`)) return;
+      try { await dnsPost({ action: 'del', name: e.name }); dnsShowMsg(`已删除 ${e.name}`, true); await dnsLoad(); }
+      catch (err) { dnsShowMsg(err.message, false); }
+    };
+    li.append(n, i, ed, del);
+    ul.appendChild(li);
+  }
+}
+async function dnsLoad() {
+  dnsInfo = await (await fetch('/api/dns', { cache: 'no-store' })).json();
+  dnsRender();
+}
+$('dnsNew').onclick = () => { $('dnsName').value = ''; $('dnsIp').value = ''; dnsShowMsg('', true); };
+$('dnsForm').onsubmit = async ev => {
+  ev.preventDefault();
+  const name = $('dnsName').value.trim().toLowerCase().replace(/\.$/, '');
+  const ip = $('dnsIp').value.trim();
+  if (!/^(?=.{1,63}$)([a-z0-9_-]+\.)*[a-z0-9_-]+$/.test(name)) { dnsShowMsg('域名格式错误：只能包含字母、数字、-、_、.，最长 63', false); return; }
+  if (ip && !/^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/.test(ip)) { dnsShowMsg('IP 格式错误，应为 IPv4，如 192.168.4.1', false); return; }
+  try {
+    await dnsPost({ action: 'set', name, ip });
+    $('dnsName').value = name;
+    dnsShowMsg(`已保存：${name} -> ${ip || dnsInfo.ap_ip + '（AP）'}`, true);
+    await dnsLoad();
+  } catch (err) { dnsShowMsg(err.message, false); }
+};
+dnsLoad().catch(() => dnsShowMsg('读取自定义解析失败', false));
 
 loadConfig().catch(() => showMsg('读取配置失败', false)).then(scan);
 

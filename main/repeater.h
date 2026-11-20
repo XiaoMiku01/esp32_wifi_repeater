@@ -51,8 +51,13 @@ void web_log_init(void);
 
 /* DNS 中继（dns_relay.c） */
 void dns_relay_start(esp_netif_t *ap, esp_netif_t *sta);
-/* 登记本地解析的域名（须在 dns_relay_start 之前调用）；ip 为网络字节序，0 表示 AP 地址 */
-esp_err_t dns_relay_add_override(const char *name, uint32_t ip);
+/* 自定义解析表（存 NVS）：ip 为网络字节序，0 表示 AP 地址 */
+#define DNS_OVR_MAX       16
+#define DNS_OVR_NAME_MAX  63
+void dns_relay_load_overrides(void);    /* NVS 初始化之后、dns_relay_start 之前调用 */
+esp_err_t dns_relay_set_override(const char *name, uint32_t ip, const char **err_msg);
+esp_err_t dns_relay_del_override(const char *name);
+void dns_relay_foreach_override(void (*fn)(const char *name, uint32_t ip, void *arg), void *arg);
 
 /* Web 服务（web_server.c） */
 esp_err_t web_server_start(void);

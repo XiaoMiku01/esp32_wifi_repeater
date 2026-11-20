@@ -5,13 +5,16 @@
  * AP 的 DHCP 服务器默认把自身地址作为 DNS 下发，客户端无论何时连入
  * （包括上游尚未连上时），拿到的 DNS 都是可用的；上游 DNS 变化也无需客户端续租。
  *
- * 本地覆盖：dns_relay_add_override() 登记的域名不转发，直接应答指定 IPv4
- * （A 记录；AAAA 等其他类型回空应答，让客户端回落到 IPv4）。
+ * 自定义解析：表中的域名不转发，直接应答指定 IPv4（A 记录；AAAA 等其他类型
+ * 回空应答，让客户端回落到 IPv4）；不在表中的域名照常转发上游。
+ * 表存 NVS（命名空间 dnsovr），可在配置页增删；首次启动预置 H2_SITE_DOMAIN -> AP 地址。
  */
 #include <string.h>
 #include <ctype.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "nvs.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_netif.h"
@@ -33,16 +36,19 @@ typedef struct {
     TickType_t ts;
 } slot_t;
 
-#define MAX_OVERRIDES 4
 #define LOCAL_TTL     60
+#define OVR_NVS_NS    "dnsovr"
+#define OVR_NVS_KEY   "table"
+#define OVR_NVS_CNT   "count"
 
 typedef struct {
-    char name[64];          /* 小写，不含结尾点 */
-    uint32_t ip;            /* 网络字节序；0 表示用 AP 自身地址 */
+    char name[DNS_OVR_NAME_MAX + 1];    /* 小写，不含结尾点 */
+    uint32_t ip;                        /* 网络字节序；0 表示用 AP 自身地址 */
 } override_t;
 
-static override_t s_ovr[MAX_OVERRIDES];
-static int s_n_ovr;
+static override_t s_ovr[DNS_OVR_MAX];
+static volatile int s_n_ovr;
+static SemaphoreHandle_t s_ovr_lock;
 
 static slot_t s_slots[SLOTS];
 static esp_netif_t *s_ap, *s_sta;
@@ -113,14 +119,19 @@ static int parse_question(const uint8_t *p, int n, char *name, size_t cap, uint1
     return off + 4;
 }
 
-static const override_t *find_override(const char *name)
+static bool lookup_override(const char *name, uint32_t *ip)
 {
+    bool hit = false;
+    xSemaphoreTake(s_ovr_lock, portMAX_DELAY);
     for (int i = 0; i < s_n_ovr; i++) {
         if (strcmp(s_ovr[i].name, name) == 0) {
-            return &s_ovr[i];
+            *ip = s_ovr[i].ip;
+            hit = true;
+            break;
         }
     }
-    return NULL;
+    xSemaphoreGive(s_ovr_lock);
+    return hit;
 }
 
 /* 在查询报文原地构造应答，返回应答长度 */
@@ -148,26 +159,157 @@ static int build_local_answer(uint8_t *p, int qend, uint16_t qtype, uint32_t ip)
     return off;
 }
 
-esp_err_t dns_relay_add_override(const char *name, uint32_t ip)
+/* ---------- 自定义解析表 ---------- */
+
+/* 规范化并校验域名：转小写、去结尾点；只允许字母数字 - _ .，标签 1-63 */
+static const char *normalize_name(const char *in, char *out)
 {
-    if (!name || strlen(name) >= sizeof(s_ovr[0].name)) {
+    size_t n = strlen(in);
+    if (n && in[n - 1] == '.') {
+        n--;
+    }
+    if (n == 0 || n > DNS_OVR_NAME_MAX) {
+        return "域名长度需为 1-63";
+    }
+    size_t label = 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = (char)tolower((unsigned char)in[i]);
+        if (c == '.') {
+            if (label == 0) {
+                return "域名格式错误（空标签）";
+            }
+            label = 0;
+        } else if (isalnum((unsigned char)c) || c == '-' || c == '_') {
+            label++;
+        } else {
+            return "域名只能包含字母、数字、-、_、.";
+        }
+        out[i] = c;
+    }
+    if (label == 0) {
+        return "域名格式错误（空标签）";
+    }
+    out[n] = '\0';
+    return NULL;
+}
+
+/* 持锁调用 */
+static esp_err_t save_table(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(OVR_NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    /* 条数单独存；空表也写入，避免重启后重新预置默认项 */
+    err = nvs_set_blob(h, OVR_NVS_KEY, s_ovr, sizeof(s_ovr));
+    if (err == ESP_OK) {
+        err = nvs_set_u8(h, OVR_NVS_CNT, (uint8_t)s_n_ovr);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+void dns_relay_load_overrides(void)
+{
+    s_ovr_lock = xSemaphoreCreateMutex();
+    nvs_handle_t h;
+    size_t len = sizeof(s_ovr);
+    uint8_t cnt = 0;
+    esp_err_t err = nvs_open(OVR_NVS_NS, NVS_READONLY, &h);
+    if (err == ESP_OK) {
+        err = nvs_get_u8(h, OVR_NVS_CNT, &cnt);
+        if (err == ESP_OK) {
+            err = nvs_get_blob(h, OVR_NVS_KEY, s_ovr, &len);
+        }
+        nvs_close(h);
+    }
+    if (err == ESP_OK && len == sizeof(s_ovr) && cnt <= DNS_OVR_MAX) {
+        s_n_ovr = cnt;
+        for (int i = 0; i < s_n_ovr; i++) {
+            s_ovr[i].name[DNS_OVR_NAME_MAX] = '\0';
+        }
+        ESP_LOGI(TAG, "已加载 %d 条自定义解析", s_n_ovr);
+    } else {
+        /* 首次启动：预置 h2 站点域名解析到 AP */
+        strlcpy(s_ovr[0].name, H2_SITE_DOMAIN, sizeof(s_ovr[0].name));
+        s_ovr[0].ip = 0;
+        s_n_ovr = 1;
+        ESP_LOGI(TAG, "无自定义解析配置，预置 %s -> AP", H2_SITE_DOMAIN);
+    }
+}
+
+esp_err_t dns_relay_set_override(const char *name, uint32_t ip, const char **err_msg)
+{
+    char norm[DNS_OVR_NAME_MAX + 1];
+    const char *msg = normalize_name(name, norm);
+    if (msg) {
+        *err_msg = msg;
         return ESP_ERR_INVALID_ARG;
     }
-    if (s_n_ovr >= MAX_OVERRIDES) {
-        return ESP_ERR_NO_MEM;
+    esp_err_t err = ESP_OK;
+    xSemaphoreTake(s_ovr_lock, portMAX_DELAY);
+    int i = 0;
+    while (i < s_n_ovr && strcmp(s_ovr[i].name, norm) != 0) {
+        i++;
     }
-    override_t *o = &s_ovr[s_n_ovr];
-    size_t i = 0;
-    for (; name[i]; i++) {
-        o->name[i] = (char)tolower((unsigned char)name[i]);
+    if (i == s_n_ovr && s_n_ovr >= DNS_OVR_MAX) {
+        *err_msg = "已达上限（16 条）";
+        err = ESP_ERR_NO_MEM;
+    } else {
+        override_t old = s_ovr[i];
+        int old_n = s_n_ovr;
+        strlcpy(s_ovr[i].name, norm, sizeof(s_ovr[i].name));
+        s_ovr[i].ip = ip;
+        if (i == s_n_ovr) {
+            s_n_ovr++;
+        }
+        err = save_table();
+        if (err != ESP_OK) {
+            s_ovr[i] = old;         /* 回滚 */
+            s_n_ovr = old_n;
+            *err_msg = "写入 NVS 失败";
+        } else {
+            *err_msg = NULL;
+            ESP_LOGI(TAG, "自定义解析 %s -> " IPSTR "%s", norm, IP2STR((esp_ip4_addr_t *)&ip),
+                     ip ? "" : "（AP 地址）");
+        }
     }
-    o->name[i] = '\0';
-    if (i && o->name[i - 1] == '.') {
-        o->name[i - 1] = '\0';
+    xSemaphoreGive(s_ovr_lock);
+    return err;
+}
+
+esp_err_t dns_relay_del_override(const char *name)
+{
+    char norm[DNS_OVR_NAME_MAX + 1];
+    if (normalize_name(name, norm)) {
+        return ESP_ERR_INVALID_ARG;
     }
-    o->ip = ip;
-    s_n_ovr++;     /* 须在 dns_relay_start 之前调用，无需加锁 */
-    return ESP_OK;
+    esp_err_t err = ESP_ERR_NOT_FOUND;
+    xSemaphoreTake(s_ovr_lock, portMAX_DELAY);
+    for (int i = 0; i < s_n_ovr; i++) {
+        if (strcmp(s_ovr[i].name, norm) == 0) {
+            memmove(&s_ovr[i], &s_ovr[i + 1], sizeof(override_t) * (s_n_ovr - i - 1));
+            s_n_ovr--;
+            err = save_table();
+            ESP_LOGI(TAG, "删除自定义解析 %s", norm);
+            break;
+        }
+    }
+    xSemaphoreGive(s_ovr_lock);
+    return err;
+}
+
+void dns_relay_foreach_override(void (*fn)(const char *name, uint32_t ip, void *arg), void *arg)
+{
+    xSemaphoreTake(s_ovr_lock, portMAX_DELAY);
+    for (int i = 0; i < s_n_ovr; i++) {
+        fn(s_ovr[i].name, s_ovr[i].ip, arg);
+    }
+    xSemaphoreGive(s_ovr_lock);
 }
 
 static void dns_relay_task(void *arg)
@@ -212,9 +354,11 @@ static void dns_relay_task(void *arg)
             char qname[256];
             uint16_t qtype;
             int qend = s_n_ovr ? parse_question(buf, n, qname, sizeof(qname), &qtype) : -1;
-            const override_t *ov = qend > 0 ? find_override(qname) : NULL;
-            if (ov && qend + 16 <= (int)sizeof(buf)) {
-                uint32_t ip = ov->ip ? ov->ip : ap_ip.ip.addr;
+            uint32_t ip;
+            if (qend > 0 && qend + 16 <= (int)sizeof(buf) && lookup_override(qname, &ip)) {
+                if (ip == 0) {
+                    ip = ap_ip.ip.addr;
+                }
                 int len = build_local_answer(buf, qend, qtype, ip);
                 sendto(lsock, buf, len, 0, (struct sockaddr *)&from, flen);
                 ESP_LOGD(TAG, "本地应答 %s type=%u", qname, qtype);

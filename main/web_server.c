@@ -8,9 +8,13 @@
  *   POST /api/restart  重启
  *   GET  /api/h2routes HTTP/2 站点自定义接口列表
  *   POST /api/h2routes 新增/修改（action=set&path=&json=）或删除（action=del&path=）
+ *   GET  /api/dns      自定义 DNS 解析列表
+ *   POST /api/dns      新增/修改（action=set&name=&ip=，ip 留空或 ap 表示 AP 地址）
+ *                      或删除（action=del&name=）
  *   GET  /ws           WebSocket，推送实时日志（二进制帧，UTF-8 文本）
  */
 #include <string.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
 #include "freertos/FreeRTOS.h"
@@ -21,6 +25,7 @@
 #include "repeater.h"
 #include "web_log_priv.h"
 #include "h2_routes.h"
+#include "lwip/inet.h"
 
 static const char *TAG = "web";
 static httpd_handle_t s_server;
@@ -452,10 +457,106 @@ static esp_err_t h2routes_post(httpd_req_t *req)
     return ret;
 }
 
+/* ---------- 自定义 DNS 解析 ---------- */
+
+static void dns_chunk(const char *name, uint32_t ip, void *arg)
+{
+    route_list_ctx_t *ctx = arg;
+    char buf[160], ipstr[16];
+    if (ip) {
+        inet_ntoa_r(*(struct in_addr *)&ip, ipstr, sizeof(ipstr));
+    } else {
+        strcpy(ipstr, "ap");
+    }
+    /* 域名已校验为 [a-z0-9-_.]，无需转义 */
+    int n = snprintf(buf, sizeof(buf), "%s{\"name\":\"%s\",\"ip\":\"%s\"}",
+                     ctx->not_first ? "," : "", name, ipstr);
+    httpd_resp_send_chunk(ctx->req, buf, n);
+    ctx->not_first = true;
+}
+
+static esp_err_t dns_get(httpd_req_t *req)
+{
+    repeater_status_t st;
+    repeater_get_status(&st);
+    char head[96];
+    snprintf(head, sizeof(head), "{\"max\":%d,\"ap_ip\":\"%s\",\"entries\":[", DNS_OVR_MAX, st.ap_ip);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr_chunk(req, head);
+    route_list_ctx_t ctx = { .req = req };
+    dns_relay_foreach_override(dns_chunk, &ctx);
+    httpd_resp_sendstr_chunk(req, "]}");
+    return httpd_resp_sendstr_chunk(req, NULL);
+}
+
+static esp_err_t dns_post(httpd_req_t *req)
+{
+    char body[256];
+    if (req->content_len == 0 || req->content_len >= sizeof(body)) {
+        return send_json_error(req, "413 Payload Too Large", "请求过大");
+    }
+    size_t got = 0;
+    while (got < req->content_len) {
+        int r = httpd_req_recv(req, body + got, req->content_len - got);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+            continue;
+        }
+        if (r <= 0) {
+            return ESP_FAIL;
+        }
+        got += r;
+    }
+    body[got] = '\0';
+
+    char action[8], name[80], ipstr[24] = "";
+    if (form_get(body, "action", action, sizeof(action)) <= 0) {
+        return send_json_error(req, "400 Bad Request", "action 须为 set 或 del");
+    }
+    int r = form_get(body, "name", name, sizeof(name));
+    if (r == 0) {
+        return send_json_error(req, "400 Bad Request", "缺少 name");
+    } else if (r < 0) {
+        return send_json_error(req, "400 Bad Request", "域名长度需为 1-63");
+    }
+    if (strcmp(action, "del") == 0) {
+        if (dns_relay_del_override(name) != ESP_OK) {
+            return send_json_error(req, "404 Not Found", "没有该域名");
+        }
+    } else if (strcmp(action, "set") == 0) {
+        if (form_get(body, "ip", ipstr, sizeof(ipstr)) < 0) {
+            return send_json_error(req, "400 Bad Request", "IP 格式错误");
+        }
+        uint32_t ip = 0;            /* 留空或 "ap"：解析为 AP 地址 */
+        if (ipstr[0] && strcmp(ipstr, "ap") != 0) {
+            /* 严格四段十进制；lwIP 的 inet_pton 会接受 "1.2.3" 这类简写 */
+            unsigned b[4];
+            char tail;
+            if (sscanf(ipstr, "%3u.%3u.%3u.%3u%c", &b[0], &b[1], &b[2], &b[3], &tail) != 4 ||
+                b[0] > 255 || b[1] > 255 || b[2] > 255 || b[3] > 255 ||
+                strspn(ipstr, "0123456789.") != strlen(ipstr)) {
+                return send_json_error(req, "400 Bad Request", "IP 格式错误，应为 IPv4，如 192.168.4.1");
+            }
+            uint8_t bytes[4] = { b[0], b[1], b[2], b[3] };
+            memcpy(&ip, bytes, 4);  /* 网络字节序 */
+            if (ip == 0 || ip == 0xFFFFFFFF) {
+                return send_json_error(req, "400 Bad Request", "IP 不能为 0.0.0.0 或 255.255.255.255");
+            }
+        }
+        const char *msg = NULL;
+        if (dns_relay_set_override(name, ip, &msg) != ESP_OK) {
+            return send_json_error(req, "400 Bad Request", msg ? msg : "保存失败");
+        }
+    } else {
+        return send_json_error(req, "400 Bad Request", "action 须为 set 或 del");
+    }
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
 esp_err_t web_server_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 12;
+    cfg.max_uri_handlers = 16;
     cfg.lru_purge_enable = true;
     cfg.stack_size = 6144;
 
@@ -475,6 +576,8 @@ esp_err_t web_server_start(void)
         { .uri = "/api/restart", .method = HTTP_POST, .handler = restart_post },
         { .uri = "/api/h2routes", .method = HTTP_GET,  .handler = h2routes_get },
         { .uri = "/api/h2routes", .method = HTTP_POST, .handler = h2routes_post },
+        { .uri = "/api/dns",      .method = HTTP_GET,  .handler = dns_get },
+        { .uri = "/api/dns",      .method = HTTP_POST, .handler = dns_post },
         { .uri = "/ws",          .method = HTTP_GET,  .handler = ws_handler, .is_websocket = true,
           .ws_post_handshake_cb = ws_post_handshake },
     };
