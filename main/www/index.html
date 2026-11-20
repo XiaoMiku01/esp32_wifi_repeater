@@ -86,6 +86,9 @@
   #rtMsg.ok, #dnsMsg.ok, #siteMsg.ok { color:var(--ok); }
   #rtMsg.bad, #dnsMsg.bad, #siteMsg.bad { color:var(--bad); }
   #siteMsg.warn { color:#d97706; }
+  #bkMsg.ok { color:var(--ok); } #bkMsg.bad { color:var(--bad); }
+  #bkLog { margin:6px 0 0; padding-left:18px; font-size:12px; color:var(--muted); }
+  #bkLog:empty { display:none; }
   .pem { min-height:90px; }
   .file-row { display:flex; justify-content:space-between; align-items:center; margin:6px 0 2px; }
   .file-row label { margin:0; }
@@ -208,6 +211,20 @@
         </div>
         <div id="rtMsg"></div>
       </form>
+    </section>
+
+    <section class="card">
+      <h2>配置备份（YAML）</h2>
+      <p class="muted">导出文件包含 Wi-Fi 密码和网页上传的私钥（明文），请妥善保管。
+        导入时，文件中出现的段（wifi、dns、h2_site、h2_routes）会整体替换设备上对应的配置，未出现的段保持不变；
+        wifi 段最后应用，改了热点时当前连接会断开。</p>
+      <div class="row">
+        <button type="button" class="primary" id="bkExport">导出 YAML</button>
+        <button type="button" id="bkImportBtn">导入 YAML</button>
+        <input type="file" id="bkFile" accept=".yaml,.yml,.txt" style="display:none">
+      </div>
+      <div id="bkMsg"></div>
+      <ol id="bkLog"></ol>
     </section>
 
     <section class="card">
@@ -558,6 +575,337 @@ $('siteReset').onclick = async () => {
   } catch (e) { siteShowMsg(e.message, 'bad'); }
 };
 siteLoad().catch(() => siteShowMsg('读取站点信息失败', 'bad'));
+
+
+/* ---------- 配置备份：YAML 导出 / 导入 ---------- */
+
+/* 单行字符串用单引号（' 写成 ''），含换行或控制字符的用双引号（JSON 转义即合法 YAML） */
+function yq(v) {
+  const s = String(v);
+  if (/[\x00-\x1f\x7f]/.test(s)) return JSON.stringify(s);
+  return "'" + s.replace(/'/g, "''") + "'";
+}
+/* 多行文本（PEM）用字面量块 | */
+function yblock(s, indent) {
+  const pad = ' '.repeat(indent);
+  const body = s.replace(/\n+$/, '');
+  const chomp = s.endsWith('\n') ? '|' : '|-';
+  return chomp + '\n' + body.split('\n').map(l => l ? pad + l : '').join('\n');
+}
+function toYaml(c) {
+  const out = [];
+  const now = new Date();
+  out.push('# ESP32 Wi-Fi 中继配置，导出时间 ' + now.toLocaleString());
+  out.push('# 包含明文密码和私钥，请妥善保管');
+  out.push('# 导入规则：出现的段整体替换设备上的对应配置，未出现的段保持不变');
+  out.push('version: 1');
+  const w = c.wifi;
+  out.push('wifi:');
+  out.push('  sta_ssid: ' + yq(w.sta_ssid));
+  out.push('  sta_password: ' + yq(w.sta_password) + '   # 留空表示开放网络');
+  out.push('  ap_ssid: ' + yq(w.ap_ssid));
+  out.push('  ap_password: ' + yq(w.ap_password) + '   # 8-63 位，留空表示开放网络');
+  out.push('  ap_max_conn: ' + w.ap_max_conn);
+  out.push('# 自定义 DNS 解析，ip 为 ap 表示本机 AP 地址；未列出的域名转发上游');
+  if (!c.dns.length) out.push('dns: []');
+  else {
+    out.push('dns:');
+    for (const e of c.dns) { out.push('  - name: ' + yq(e.name)); out.push('    ip: ' + yq(e.ip)); }
+  }
+  out.push('# HTTP/2 站点；省略 cert/key 表示使用固件内嵌证书');
+  out.push('h2_site:');
+  out.push('  domain: ' + yq(c.h2_site.domain));
+  if (c.h2_site.cert && c.h2_site.key) {
+    out.push('  cert: ' + yblock(c.h2_site.cert, 4));
+    out.push('  key: ' + yblock(c.h2_site.key, 4));
+  }
+  out.push('# HTTP/2 自定义接口：路径 -> 应答 JSON');
+  if (!c.h2_routes.length) out.push('h2_routes: []');
+  else {
+    out.push('h2_routes:');
+    for (const r of c.h2_routes) { out.push('  - path: ' + yq(r.path)); out.push('    json: ' + yq(r.json)); }
+  }
+  return out.join('\n') + '\n';
+}
+
+/* YAML 子集解析：映射、列表（含列表内映射）、引号/普通标量、数字、布尔、null、| 块文本、注释、[] {} */
+function parseYaml(text) {
+  const lines = text.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').split('\n');
+  let i = 0;
+  const fail = (msg, ln = i) => { throw new Error(`第 ${ln + 1} 行：${msg}`); };
+  const indentOf = l => l.match(/^ */)[0].length;
+  const blank = l => { const t = l.trim(); return t === '' || t.startsWith('#'); };
+  const skip = () => { while (i < lines.length && blank(lines[i])) i++; };
+  const isItem = t => t === '-' || t.startsWith('- ');
+  function stripComment(s) {
+    let q = null;
+    for (let k = 0; k < s.length; k++) {
+      const ch = s[k];
+      if (q) {
+        if (q === '"' && ch === '\\') { k++; continue; }
+        if (ch === q) { if (q === "'" && s[k + 1] === "'") { k++; continue; } q = null; }
+      } else if ((ch === "'" || ch === '"') && (k === 0 || /[\s:\-\[{,]/.test(s[k - 1]))) {
+        q = ch;
+      } else if (ch === '#' && (k === 0 || /\s/.test(s[k - 1]))) {
+        return s.slice(0, k).trimEnd();
+      }
+    }
+    return s.trimEnd();
+  }
+  function scalar(raw, ln) {
+    const s = raw.trim();
+    if (s === '' || s === '~' || s === 'null') return null;
+    if (s[0] === "'") {
+      if (s.length < 2 || s[s.length - 1] !== "'") fail('单引号字符串未闭合', ln);
+      return s.slice(1, -1).replace(/''/g, "'");
+    }
+    if (s[0] === '"') {
+      try { return JSON.parse(s); } catch (e) { fail('双引号字符串格式错误', ln); }
+    }
+    if (s === 'true') return true;
+    if (s === 'false') return false;
+    if (/^-?(0|[1-9]\d{0,14})$/.test(s)) return Number(s);   /* 前导 0 等按文本处理，避免 0123 变 123 */
+    if (s === '[]') return [];
+    if (s === '{}') return {};
+    if (s[0] === '[' || s[0] === '{') fail('不支持行内列表/映射（[] {} 除外）', ln);
+    return s;
+  }
+  function blockText(parentIndent, chomp) {
+    const out = [];
+    let ind = -1;
+    while (i < lines.length) {
+      const l = lines[i];
+      if (l.trim() === '') { out.push(''); i++; continue; }
+      const n = indentOf(l);
+      if (n <= parentIndent) break;
+      if (ind < 0) ind = n;
+      out.push(l.slice(Math.min(ind, n)));
+      i++;
+    }
+    let s = out.join('\n');
+    if (chomp === '+') return s + '\n';
+    s = s.replace(/\n+$/, '');
+    return chomp === '-' ? s : s + '\n';
+  }
+  function value(rest, keyIndent, ln) {
+    const r = stripComment(rest).trim();
+    const m = r.match(/^\|([+-]?)$/);
+    if (m) return blockText(keyIndent, m[1]);
+    if (r.startsWith('>')) fail('不支持折叠块 >，请改用 |', ln);
+    if (r !== '') return scalar(r, ln);
+    skip();
+    if (i >= lines.length) return null;
+    const n = indentOf(lines[i]);
+    const t = lines[i].slice(n);
+    if (isItem(t) && n >= keyIndent) return list(n);
+    if (n <= keyIndent) return null;
+    return map(n);
+  }
+  function map(indent) {
+    const obj = {};
+    for (;;) {
+      skip();
+      if (i >= lines.length) break;
+      const l = lines[i], n = indentOf(l);
+      if (n < indent) break;
+      if (n > indent) fail('缩进不一致');
+      const t = l.slice(n);
+      if (isItem(t)) break;
+      const m = t.match(/^('(?:[^']|'')*'|"(?:[^"\\]|\\.)*"|[^\s#'"][^:]*?)\s*:(?:\s+(.*))?$/);
+      if (!m) fail('应为 “键: 值”');
+      const key = String(scalar(m[1], i));
+      if (key in obj) fail(`重复的键 ${key}`);
+      const ln = i++;
+      obj[key] = value(m[2] || '', n, ln);
+    }
+    return obj;
+  }
+  function list(indent) {
+    const arr = [];
+    for (;;) {
+      skip();
+      if (i >= lines.length) break;
+      const l = lines[i], n = indentOf(l);
+      if (n < indent) break;
+      const t = l.slice(n);
+      if (n > indent) fail('缩进不一致');
+      if (!isItem(t)) break;
+      const rest = t.slice(1);
+      const inner = n + 1 + (rest.length - rest.trimStart().length);
+      const content = stripComment(rest).trim();
+      if (content === '') {
+        const ln = i++;
+        arr.push(value('', n, ln));
+      } else if (/^('(?:[^']|'')*'|"(?:[^"\\]|\\.)*"|[^\s#'"\-][^:]*?)\s*:(\s|$)/.test(content)) {
+        lines[i] = ' '.repeat(inner) + rest.trimStart();   /* 把 "- k: v" 当作缩进 inner 的映射起始行 */
+        arr.push(map(inner));
+      } else {
+        arr.push(scalar(content, i));
+        i++;
+      }
+    }
+    return arr;
+  }
+  skip();
+  if (i >= lines.length) throw new Error('文件为空');
+  if (indentOf(lines[i]) !== 0 || isItem(lines[i].trim())) fail('顶层须为映射');
+  const doc = map(0);
+  skip();
+  if (i < lines.length) fail('无法解析的内容');
+  return doc;
+}
+
+/* 校验并规范化导入内容；返回 {wifi?, dns?, h2_site?, h2_routes?} */
+function checkConfig(d) {
+  if (typeof d !== 'object' || d === null || Array.isArray(d)) throw new Error('顶层须为映射');
+  if (d.version !== undefined && d.version !== 1) throw new Error(`不支持的 version: ${d.version}`);
+  const known = ['version', 'wifi', 'dns', 'h2_site', 'h2_routes'];
+  for (const k of Object.keys(d)) if (!known.includes(k)) throw new Error(`未知的段：${k}`);
+  const str = (v, name) => {
+    if (v === null || v === undefined) return '';
+    if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+    if (typeof v !== 'string') throw new Error(`${name} 须为字符串`);
+    return v;
+  };
+  const out = {};
+  if (d.wifi !== undefined) {
+    const w = d.wifi;
+    if (!w || typeof w !== 'object' || Array.isArray(w)) throw new Error('wifi 须为映射');
+    const o = {};
+    if ('sta_ssid' in w) { o.sta_ssid = str(w.sta_ssid, 'wifi.sta_ssid'); if (!o.sta_ssid || utf8Len(o.sta_ssid) > 32) throw new Error('wifi.sta_ssid 长度需为 1-32'); }
+    if ('sta_password' in w) { o.sta_password = str(w.sta_password, 'wifi.sta_password'); if (utf8Len(o.sta_password) > 64) throw new Error('wifi.sta_password 过长'); }
+    if ('ap_ssid' in w) { o.ap_ssid = str(w.ap_ssid, 'wifi.ap_ssid'); if (!o.ap_ssid || utf8Len(o.ap_ssid) > 32) throw new Error('wifi.ap_ssid 长度需为 1-32'); }
+    if ('ap_password' in w) { o.ap_password = str(w.ap_password, 'wifi.ap_password'); const n = utf8Len(o.ap_password); if (n && (n < 8 || n > 63)) throw new Error('wifi.ap_password 需为 8-63 位或留空'); }
+    if ('ap_max_conn' in w) { o.ap_max_conn = Number(w.ap_max_conn); if (!Number.isInteger(o.ap_max_conn) || o.ap_max_conn < 1 || o.ap_max_conn > 15) throw new Error('wifi.ap_max_conn 需为 1-15'); }
+    out.wifi = o;
+  }
+  if (d.dns !== undefined) {
+    const list = d.dns === null ? [] : d.dns;
+    if (!Array.isArray(list)) throw new Error('dns 须为列表');
+    if (list.length > 16) throw new Error('dns 最多 16 条');
+    out.dns = list.map((e, k) => {
+      if (!e || typeof e !== 'object') throw new Error(`dns 第 ${k + 1} 条须为映射`);
+      const name = str(e.name, `dns[${k + 1}].name`).trim();
+      let ip = str(e.ip, `dns[${k + 1}].ip`).trim();
+      if (!name) throw new Error(`dns 第 ${k + 1} 条缺少 name`);
+      if (ip.toLowerCase() === 'ap') ip = '';
+      if (ip && !/^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/.test(ip)) throw new Error(`dns 第 ${k + 1} 条 ip 格式错误：${ip}`);
+      return { name, ip };
+    });
+  }
+  if (d.h2_site !== undefined) {
+    const s = d.h2_site;
+    if (!s || typeof s !== 'object' || Array.isArray(s)) throw new Error('h2_site 须为映射');
+    const domain = str(s.domain, 'h2_site.domain').trim();
+    const cert = str(s.cert, 'h2_site.cert').trim(), key = str(s.key, 'h2_site.key').trim();
+    if (!domain) throw new Error('h2_site.domain 不能为空');
+    if (!!cert !== !!key) throw new Error('h2_site 的 cert 和 key 须同时提供或同时省略');
+    out.h2_site = { domain, cert, key };
+  }
+  if (d.h2_routes !== undefined) {
+    const list = d.h2_routes === null ? [] : d.h2_routes;
+    if (!Array.isArray(list)) throw new Error('h2_routes 须为列表');
+    if (list.length > 8) throw new Error('h2_routes 最多 8 条');
+    out.h2_routes = list.map((r, k) => {
+      if (!r || typeof r !== 'object') throw new Error(`h2_routes 第 ${k + 1} 条须为映射`);
+      const path = str(r.path, `h2_routes[${k + 1}].path`).trim();
+      if (!path) throw new Error(`h2_routes 第 ${k + 1} 条缺少 path`);
+      let json;
+      if (typeof r.json === 'string') {
+        try { json = JSON.stringify(JSON.parse(r.json)); } catch (e) { throw new Error(`h2_routes 第 ${k + 1} 条 json 不是合法 JSON`); }
+      } else if (r.json !== null && typeof r.json === 'object') {
+        json = JSON.stringify(r.json);
+      } else {
+        throw new Error(`h2_routes 第 ${k + 1} 条缺少 json`);
+      }
+      return { path, json };
+    });
+  }
+  return out;
+}
+
+function bkShowMsg(t, ok) { const m = $('bkMsg'); m.textContent = t; m.className = ok ? 'ok' : 'bad'; }
+function bkLog(t) { const li = document.createElement('li'); li.textContent = t; $('bkLog').appendChild(li); }
+async function apiPost(url, fields) {
+  const r = await fetch(url, { method: 'POST', body: new URLSearchParams(fields) });
+  let j = {};
+  try { j = await r.json(); } catch (e) {}
+  if (!r.ok || !j.ok) throw new Error(j.error || `请求失败（${r.status}）`);
+  return j;
+}
+async function apiGet(url) { return (await fetch(url, { cache: 'no-store' })).json(); }
+
+$('bkExport').onclick = async () => {
+  try {
+    const c = await apiGet('/api/export');
+    const blob = new Blob([toYaml(c)], { type: 'application/x-yaml' });
+    const d = new Date(), pad = n => String(n).padStart(2, '0');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `esp32-repeater-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.yaml`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    bkShowMsg('已导出 ' + a.download, true);
+  } catch (e) { bkShowMsg('导出失败：' + e.message, false); }
+};
+
+$('bkImportBtn').onclick = () => { $('bkFile').value = ''; $('bkFile').click(); };
+$('bkFile').onchange = async () => {
+  const f = $('bkFile').files[0];
+  if (!f) return;
+  $('bkLog').textContent = '';
+  let cfg;
+  try { cfg = checkConfig(parseYaml(await f.text())); }
+  catch (e) { bkShowMsg('文件无效，未做任何修改。' + e.message, false); return; }
+  const parts = [];
+  if (cfg.h2_site) parts.push(`HTTP/2 站点（${cfg.h2_site.domain}${cfg.h2_site.cert ? '，含证书' : '，内嵌证书'}）`);
+  if (cfg.dns) parts.push(`DNS 自定义解析 ${cfg.dns.length} 条`);
+  if (cfg.h2_routes) parts.push(`HTTP/2 自定义接口 ${cfg.h2_routes.length} 个`);
+  if (cfg.wifi) parts.push('Wi-Fi 设置');
+  if (!parts.length) { bkShowMsg('文件中没有可导入的段', false); return; }
+  if (!confirm('将替换以下配置：\n- ' + parts.join('\n- ') + '\n\n确定导入？')) return;
+
+  bkShowMsg('导入中…', true);
+  try {
+    if (cfg.h2_site) {
+      const s = cfg.h2_site;
+      if (s.cert) {
+        const j = await apiPost('/api/h2site', { action: 'set', domain: s.domain, cert: s.cert + '\n', key: s.key + '\n' });
+        bkLog(`HTTP/2 站点：${s.domain}，证书已替换` + (j.warning ? `（${j.warning}）` : ''));
+      } else {
+        await apiPost('/api/h2site', { action: 'reset' });
+        const j = await apiPost('/api/h2site', { action: 'set', domain: s.domain, cert: '', key: '' });
+        bkLog(`HTTP/2 站点：${s.domain}，使用内嵌证书` + (j.warning ? `（${j.warning}）` : ''));
+      }
+    }
+    if (cfg.dns) {
+      const cur = await apiGet('/api/dns');
+      for (const e of cur.entries) await apiPost('/api/dns', { action: 'del', name: e.name });
+      for (const e of cfg.dns) await apiPost('/api/dns', { action: 'set', name: e.name, ip: e.ip });
+      bkLog(`DNS 自定义解析：已替换为 ${cfg.dns.length} 条`);
+    }
+    if (cfg.h2_routes) {
+      const cur = await apiGet('/api/h2routes');
+      for (const r of cur.routes) await apiPost('/api/h2routes', { action: 'del', path: r.path });
+      for (const r of cfg.h2_routes) await apiPost('/api/h2routes', { action: 'set', path: r.path, json: r.json });
+      bkLog(`HTTP/2 自定义接口：已替换为 ${cfg.h2_routes.length} 个`);
+    }
+    if (cfg.wifi) {
+      const w = cfg.wifi, f = {};
+      if ('sta_ssid' in w) f.sta_ssid = w.sta_ssid;
+      if ('sta_password' in w) { f.sta_pass = w.sta_password; f.sta_open = w.sta_password ? '0' : '1'; }
+      if ('ap_ssid' in w) f.ap_ssid = w.ap_ssid;
+      if ('ap_password' in w) { f.ap_pass = w.ap_password; f.ap_open = w.ap_password ? '0' : '1'; }
+      if ('ap_max_conn' in w) f.ap_max_conn = String(w.ap_max_conn);
+      await apiPost('/api/config', f);
+      bkLog('Wi-Fi 设置：已保存，正在应用（若修改了热点，当前连接会断开）');
+    }
+    bkShowMsg('导入完成', true);
+  } catch (e) {
+    bkShowMsg('导入中断：' + e.message + '（之前的步骤已生效）', false);
+  }
+  Promise.all([siteLoad(), dnsLoad(), rtLoad(), loadConfig()]).catch(() => {});
+};
 
 loadConfig().catch(() => showMsg('读取配置失败', false)).then(scan);
 

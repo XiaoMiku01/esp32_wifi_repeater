@@ -14,6 +14,8 @@
  *   GET  /api/h2site   HTTP/2 站点域名与证书信息（不含私钥）
  *   POST /api/h2site   修改（action=set&domain=&cert=&key=，cert/key 同时为空表示只改域名）
  *                      或恢复内嵌（action=reset）
+ *   GET  /api/export   导出全部配置 JSON（含 Wi-Fi 密码与网页上传的私钥），网页端转为 YAML；
+ *                      导入由网页解析 YAML 后逐段调用上述接口完成
  *   GET  /ws           WebSocket，推送实时日志（二进制帧，UTF-8 文本）
  */
 #include <string.h>
@@ -638,6 +640,68 @@ static esp_err_t h2site_post(httpd_req_t *req)
     return ret;
 }
 
+/* ---------- 配置导出（含密码与私钥，网页端转换为 YAML） ---------- */
+
+static void chunk_json_str(httpd_req_t *req, const char *s)
+{
+    size_t cap = strlen(s) * 6 + 3;
+    char *b = malloc(cap);
+    if (!b) {
+        return;
+    }
+    size_t n = json_str(b, cap, s);
+    httpd_resp_send_chunk(req, b, n);
+    free(b);
+}
+
+static void export_site(const char *domain, const char *cert, const char *key, void *arg)
+{
+    httpd_req_t *req = arg;
+    httpd_resp_sendstr_chunk(req, "\"h2_site\":{\"domain\":");
+    chunk_json_str(req, domain);
+    if (cert && key) {
+        httpd_resp_sendstr_chunk(req, ",\"cert\":");
+        chunk_json_str(req, cert);
+        httpd_resp_sendstr_chunk(req, ",\"key\":");
+        chunk_json_str(req, key);
+    }
+    httpd_resp_sendstr_chunk(req, "}");
+}
+
+static esp_err_t export_get(httpd_req_t *req)
+{
+    repeater_cfg_t c;
+    repeater_get_cfg(&c);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+    httpd_resp_sendstr_chunk(req, "{\"version\":1,\"wifi\":{\"sta_ssid\":");
+    chunk_json_str(req, c.sta_ssid);
+    httpd_resp_sendstr_chunk(req, ",\"sta_password\":");
+    chunk_json_str(req, c.sta_pass);
+    httpd_resp_sendstr_chunk(req, ",\"ap_ssid\":");
+    chunk_json_str(req, c.ap_ssid);
+    httpd_resp_sendstr_chunk(req, ",\"ap_password\":");
+    chunk_json_str(req, c.ap_pass);
+    char num[48];
+    snprintf(num, sizeof(num), ",\"ap_max_conn\":%u},", c.ap_max_conn);
+    httpd_resp_sendstr_chunk(req, num);
+
+    route_list_ctx_t ctx = { .req = req };
+    httpd_resp_sendstr_chunk(req, "\"dns\":[");
+    dns_relay_foreach_override(dns_chunk, &ctx);
+    httpd_resp_sendstr_chunk(req, "],");
+
+    h2_site_export(export_site, req);
+
+    ctx.not_first = false;
+    httpd_resp_sendstr_chunk(req, ",\"h2_routes\":[");
+    h2_routes_foreach(route_chunk, &ctx);
+    httpd_resp_sendstr_chunk(req, "]}");
+    ESP_LOGI(TAG, "配置已导出");
+    return httpd_resp_sendstr_chunk(req, NULL);
+}
+
 esp_err_t web_server_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
@@ -665,6 +729,7 @@ esp_err_t web_server_start(void)
         { .uri = "/api/dns",      .method = HTTP_POST, .handler = dns_post },
         { .uri = "/api/h2site",   .method = HTTP_GET,  .handler = h2site_get },
         { .uri = "/api/h2site",   .method = HTTP_POST, .handler = h2site_post },
+        { .uri = "/api/export",   .method = HTTP_GET,  .handler = export_get },
         { .uri = "/ws",          .method = HTTP_GET,  .handler = ws_handler, .is_websocket = true,
           .ws_post_handshake_cb = ws_post_handshake },
     };

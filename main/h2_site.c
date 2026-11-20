@@ -382,6 +382,13 @@ static size_t json_esc(char *out, size_t cap, const char *s)
     return o;
 }
 
+void h2_site_export(void (*fn)(const char *domain, const char *cert, const char *key, void *arg), void *arg)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    fn(s_domain, s_cert_custom ? (const char *)s_cert : NULL, s_cert_custom ? (const char *)s_key : NULL, arg);
+    xSemaphoreGive(s_lock);
+}
+
 int h2_site_info_json(char *out, size_t cap)
 {
     mbedtls_x509_crt crt;
