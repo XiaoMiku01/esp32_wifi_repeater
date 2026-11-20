@@ -10,3 +10,4 @@ managed_components/
 .vscode/
 .DS_Store
 main/certs2/
+scripts/sign-leaf.sh
