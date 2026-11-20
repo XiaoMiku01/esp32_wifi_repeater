@@ -42,7 +42,8 @@ static const char *TAG = "monitor";
 #define BLOCKIP_MAX     256
 #define ASM_SLOTS       4
 #define ASM_CAP         2048            /* TLS ClientHello 重组上限 */
-#define LIVE_BUF        (128 * 1024)
+#define LIVE_BUF        (192 * 1024)    /* 256 条连接 × 含 URL 的 JSON */
+#define URL_MAX         200
 #define NVS_NS          "monblock"      /* 旧版本保存黑名单的命名空间，开机时清除 */
 
 typedef struct {
@@ -67,6 +68,9 @@ typedef struct {
     uint32_t rup, rdown;
     uint32_t c_next, c_ack;             /* 用于构造发给客户端的 RST */
     char domain[MON_NAME_MAX + 1];
+    char method[8];                     /* HTTP（80 端口）最近一次请求 */
+    char url[URL_MAX + 1];
+    uint16_t reqs;                      /* 该连接上的 HTTP 请求数 */
 } flow_t;
 
 typedef struct {
@@ -510,6 +514,99 @@ static bool parse_host(const uint8_t *d, size_t n, char *out)
     return false;
 }
 
+/* ---------- HTTP 请求行 -> 完整 URL ---------- */
+
+static const char *const s_http_methods[] = {
+    "GET ", "POST ", "HEAD ", "PUT ", "DELETE ", "OPTIONS ", "PATCH ", "CONNECT ", NULL
+};
+
+/* 数据以 HTTP 方法开头则返回方法长度（含空格），否则 0 */
+static int http_method_len(const uint8_t *d, size_t n)
+{
+    for (int i = 0; s_http_methods[i]; i++) {
+        size_t l = strlen(s_http_methods[i]);
+        if (n >= l && memcmp(d, s_http_methods[i], l) == 0) {
+            return (int)l;
+        }
+    }
+    return 0;
+}
+
+/* 追加到 URL：保留可见 ASCII，空白、非 ASCII、引号与反斜杠转成 %XX（JSON 安全）；返回是否截断 */
+static bool url_append(char *out, size_t cap, size_t *o, const char *s, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c > 0x20 && c < 0x7f && c != '"' && c != '\\') {
+            if (*o + 1 >= cap) return true;
+            out[(*o)++] = (char)c;
+        } else {
+            if (*o + 3 >= cap) return true;
+            *o += snprintf(out + *o, cap - *o, "%%%02X", c);
+        }
+    }
+    out[*o] = '\0';
+    return false;
+}
+
+/* 解析 HTTP 请求的首行与 Host 头，得到方法与完整 URL（http://host/path?query）。
+ * 请求行须在本段内完整；Host 头缺失时用 "?" 代替；超长 URL 以 "..." 结尾 */
+static bool parse_http_req(const uint8_t *d, size_t n, char *method, size_t mcap, char *url, size_t ucap)
+{
+    int ml = http_method_len(d, n);
+    if (!ml || (size_t)ml > mcap) {
+        return false;
+    }
+    memcpy(method, d, ml - 1);
+    method[ml - 1] = '\0';
+    size_t le = ml;
+    while (le < n && d[le] != '\r' && d[le] != '\n') le++;
+    if (le >= n) {
+        return false;                               /* 请求行不完整 */
+    }
+    size_t ts = ml, te = ts;
+    while (te < le && d[te] != ' ') te++;
+    if (te == ts) {
+        return false;
+    }
+    const char *target = (const char *)d + ts;
+    size_t tlen = te - ts;
+
+    /* Host 头（保留端口） */
+    const char *host = "?";
+    size_t hlen = 1;
+    for (size_t i = le; i + 6 < n; i++) {
+        if (d[i] == '\n' && strncasecmp((const char *)d + i + 1, "host:", 5) == 0) {
+            size_t a = i + 6, b;
+            while (a < n && (d[a] == ' ' || d[a] == '\t')) a++;
+            b = a;
+            while (b < n && d[b] != '\r' && d[b] != '\n') b++;
+            while (b > a && (d[b - 1] == ' ' || d[b - 1] == '\t')) b--;
+            if (b > a) {
+                host = (const char *)d + a;
+                hlen = b - a;
+            }
+            break;
+        }
+    }
+
+    size_t o = 0;
+    bool cut;
+    url[0] = '\0';
+    if (tlen >= 7 && strncasecmp(target, "http://", 7) == 0) {
+        cut = url_append(url, ucap, &o, target, tlen);            /* 代理形式，已是完整 URL */
+    } else {
+        cut = url_append(url, ucap, &o, "http://", 7) ||
+              url_append(url, ucap, &o, host, hlen) ||
+              (target[0] != '/' && url_append(url, ucap, &o, "/", 1)) ||
+              url_append(url, ucap, &o, target, tlen);
+    }
+    if (cut && ucap > 4) {
+        strcpy(url + (o < ucap - 4 ? o : ucap - 4), "...");
+    }
+    return true;
+}
+
 static void set_domain(flow_t *f, const char *name, uint8_t src)
 {
     strlcpy(f->domain, name, sizeof(f->domain));
@@ -536,9 +633,21 @@ static void inspect(flow_t *f, struct pbuf *p, uint16_t off, uint16_t plen)
 {
     char name[MON_NAME_MAX + 1];
     if (f->rport == 80) {
+        /* 不置 inspected：持久连接上的每个请求都要识别。先只读 8 字节判断是否为请求开头 */
+        uint8_t head[8];
+        uint16_t hn = pbuf_copy_partial(p, head, plen < sizeof(head) ? plen : sizeof(head), off);
+        if (!http_method_len(head, hn) && hn >= 3) {
+            return;                                 /* 请求体等后续数据 */
+        }
         uint16_t n = pbuf_copy_partial(p, s_scratch, plen < 1024 ? plen : 1024, off);
-        if (parse_host(s_scratch, n, name)) set_domain(f, name, 3);
-        f->inspected = true;
+        char method[sizeof(f->method)];
+        if (parse_http_req(s_scratch, n, method, sizeof(method), f->url, sizeof(f->url))) {
+            strlcpy(f->method, method, sizeof(f->method));
+            f->reqs++;
+        }
+        if ((f->dom_src != 3 || !f->domain[0]) && parse_host(s_scratch, n, name)) {
+            set_domain(f, name, 3);
+        }
         return;
     }
     if (f->rport != 443) {
@@ -947,11 +1056,12 @@ char *monitor_live_json(size_t *len)
         ip_str(f->rip, rip);
         sb_printf(&s, "%s{\"id\":%lu,\"cip\":\"%s\",\"cport\":%u,\"rip\":\"%s\",\"rport\":%u,\"type\":\"%s\","
                   "\"domain\":\"%s\",\"src\":\"%s\",\"first\":%lu,\"last\":%lu,\"up\":%llu,\"down\":%llu,"
-                  "\"rup\":%lu,\"rdown\":%lu,\"state\":\"%s\"}",
+                  "\"rup\":%lu,\"rdown\":%lu,\"state\":\"%s\",\"method\":\"%s\",\"url\":\"%s\",\"reqs\":%u}",
                   first ? "" : ",", (unsigned long)f->id, ip, f->cport, rip, f->rport, flow_type(f, tbuf),
                   f->domain, src_name[f->dom_src & 3], (unsigned long)f->first, (unsigned long)f->last,
                   (unsigned long long)f->up, (unsigned long long)f->down, (unsigned long)f->rup,
-                  (unsigned long)f->rdown, f->blocked ? "blocked" : (f->closing ? "closed" : "open"));
+                  (unsigned long)f->rdown, f->blocked ? "blocked" : (f->closing ? "closed" : "open"),
+                  f->method, f->url, f->reqs);
         first = false;
     }
     xSemaphoreGive(s_lock);

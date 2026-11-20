@@ -41,6 +41,8 @@
   th { position:sticky; top:0; background:var(--card); font-weight:600; color:var(--muted); z-index:1; }
   td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; }
   td.dom { max-width:280px; overflow:hidden; text-overflow:ellipsis; }
+  td.dom.url { max-width:460px; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; }
+  td.dom .m { color:var(--accent); font-weight:600; margin-right:4px; }
   tr.sel { background:rgba(37,99,235,.12); }
   tr.click { cursor:pointer; }
   tr.click:hover { background:rgba(127,127,127,.08); }
@@ -113,12 +115,12 @@
     <h2>连接 <span class="muted" id="flowCount"></span>
       <span class="spacer"></span>
       <span class="badge" id="filterTag" style="display:none"></span>
-      <input type="text" id="flowSearch" placeholder="搜索域名 / IP / 类型">
+      <input type="text" id="flowSearch" placeholder="搜索域名 / URL / IP / 类型">
       <label class="row muted" style="gap:4px"><input type="checkbox" id="hideClosed" checked>隐藏已关闭</label>
     </h2>
     <div class="tbl">
       <table>
-        <thead><tr><th>设备</th><th>类型</th><th>域名</th><th>远端</th>
+        <thead><tr><th>设备</th><th>类型</th><th>域名 / URL</th><th>远端</th>
           <th class="num">↑ 速率</th><th class="num">↓ 速率</th><th class="num">累计 ↑</th><th class="num">累计 ↓</th>
           <th class="num">时长</th><th>状态</th><th></th></tr></thead>
         <tbody id="flows"></tbody>
@@ -220,16 +222,24 @@ function renderFlows(list) {
   lastFlows = list;
   const q = $('flowSearch').value.trim().toLowerCase(), hide = $('hideClosed').checked;
   const rows = list.filter(f => (!selIp || f.cip === selIp) && (!hide || f.state !== 'closed') &&
-    (!q || (f.domain + ' ' + f.rip + ' ' + f.type + ' ' + f.cip).toLowerCase().includes(q)));
+    (!q || (f.domain + ' ' + f.url + ' ' + f.rip + ' ' + f.type + ' ' + f.cip).toLowerCase().includes(q)));
   rows.sort((a, b) => ((b.rup + b.rdown) - (a.rup + a.rdown)) || (b.last - a.last));
   $('flowCount').textContent = `（显示 ${Math.min(rows.length, 300)} / 共 ${list.length}）`;
   const tb = $('flows'); tb.textContent = '';
   for (const f of rows.slice(0, 300)) {
     const tr = el('tr', undefined, f.state === 'blocked' ? 'blocked' : f.state === 'closed' ? 'closed' : '');
     const dom = el('td', undefined, 'dom');
-    dom.textContent = f.domain || '-';
-    dom.title = f.domain;
-    if (f.domain && f.src) dom.appendChild(el('span', SRC[f.src] || f.src, 'src'));
+    if (f.url) {
+      /* HTTP（80 端口）：显示最近一次请求的完整 URL */
+      dom.classList.add('url');
+      dom.append(el('span', f.method, 'm'), document.createTextNode(f.url));
+      if (f.reqs > 1) dom.appendChild(el('span', `第 ${f.reqs} 个请求`, 'src'));
+      dom.title = `${f.method} ${f.url}` + (f.reqs > 1 ? `\n（该连接共 ${f.reqs} 个请求，显示最近一个）` : '');
+    } else {
+      dom.textContent = f.domain || '-';
+      dom.title = f.domain;
+      if (f.domain && f.src) dom.appendChild(el('span', SRC[f.src] || f.src, 'src'));
+    }
     const st = el('td');
     st.appendChild(el('span', f.state === 'blocked' ? '已拦截' : f.state === 'closed' ? '已关闭' : '活动',
       'badge ' + (f.state === 'blocked' ? 'bad' : f.state === 'open' ? 'ok' : '')));
