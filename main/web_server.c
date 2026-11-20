@@ -6,6 +6,8 @@
  *   POST /api/config   保存并应用配置，表单编码
  *   GET  /api/scan     扫描周边网络（阻塞约 2-3 秒）
  *   POST /api/restart  重启
+ *   GET  /api/h2routes HTTP/2 站点自定义接口列表
+ *   POST /api/h2routes 新增/修改（action=set&path=&json=）或删除（action=del&path=）
  *   GET  /ws           WebSocket，推送实时日志（二进制帧，UTF-8 文本）
  */
 #include <string.h>
@@ -18,6 +20,7 @@
 #include "esp_system.h"
 #include "repeater.h"
 #include "web_log_priv.h"
+#include "h2_routes.h"
 
 static const char *TAG = "web";
 static httpd_handle_t s_server;
@@ -335,10 +338,124 @@ static esp_err_t ws_handler(httpd_req_t *req)
     return err;
 }
 
+/* ---------- HTTP/2 站点自定义接口 ---------- */
+
+typedef struct {
+    httpd_req_t *req;
+    bool not_first;
+} route_list_ctx_t;
+
+static void route_chunk(const char *path, const char *json, void *arg)
+{
+    route_list_ctx_t *ctx = arg;
+    /* 每个字符最多转义成 6 字节 */
+    size_t cap = strlen(json) * 6 + strlen(path) * 6 + 32;
+    char *buf = malloc(cap);
+    if (!buf) {
+        return;
+    }
+    size_t o = 0;
+    o += snprintf(buf + o, cap - o, "%s{\"path\":", ctx->not_first ? "," : "");
+    o += json_str(buf + o, cap - o, path);
+    o += snprintf(buf + o, cap - o, ",\"json\":");
+    o += json_str(buf + o, cap - o, json);
+    o += snprintf(buf + o, cap - o, "}");
+    httpd_resp_send_chunk(ctx->req, buf, o);
+    free(buf);
+    ctx->not_first = true;
+}
+
+static esp_err_t h2routes_get(httpd_req_t *req)
+{
+    char head[160];
+    snprintf(head, sizeof(head),
+             "{\"domain\":\"%s\",\"port\":%d,\"max\":%d,\"max_json\":%d,\"routes\":[",
+             H2_SITE_DOMAIN, H2_SITE_PORT, H2_ROUTES_MAX, H2_ROUTE_JSON_MAX);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr_chunk(req, head);
+    route_list_ctx_t ctx = { .req = req };
+    h2_routes_foreach(route_chunk, &ctx);
+    httpd_resp_sendstr_chunk(req, "]}");
+    return httpd_resp_sendstr_chunk(req, NULL);
+}
+
+/* 读取表单字段到新分配的缓冲区（已 URL 解码），不存在或非法返回 NULL */
+static char *form_get_alloc(const char *body, const char *key)
+{
+    size_t cap = strlen(body) + 1;
+    char *raw = malloc(cap), *out = malloc(cap);
+    if (!raw || !out || httpd_query_key_value(body, key, raw, cap) != ESP_OK ||
+        !url_decode(raw, out, cap)) {
+        free(raw);
+        free(out);
+        return NULL;
+    }
+    free(raw);
+    return out;
+}
+
+static esp_err_t h2routes_post(httpd_req_t *req)
+{
+    const size_t max = (H2_ROUTE_PATH_MAX + H2_ROUTE_JSON_MAX) * 3 + 64;
+    if (req->content_len == 0 || req->content_len > max) {
+        return send_json_error(req, "413 Payload Too Large", "请求过大");
+    }
+    char *body = malloc(req->content_len + 1);
+    if (!body) {
+        return send_json_error(req, "500 Internal Server Error", "内存不足");
+    }
+    size_t got = 0;
+    while (got < req->content_len) {
+        int r = httpd_req_recv(req, body + got, req->content_len - got);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+            continue;
+        }
+        if (r <= 0) {
+            free(body);
+            return ESP_FAIL;
+        }
+        got += r;
+    }
+    body[got] = '\0';
+
+    char *action = form_get_alloc(body, "action");
+    char *path = form_get_alloc(body, "path");
+    char *json = form_get_alloc(body, "json");
+    free(body);
+
+    esp_err_t ret;
+    const char *msg = NULL;
+    if (!action || !path) {
+        ret = send_json_error(req, "400 Bad Request", "缺少 action 或 path");
+    } else if (strcmp(action, "set") == 0) {
+        if (!json) {
+            ret = send_json_error(req, "400 Bad Request", "缺少 json");
+        } else if (h2_routes_set(path, json, &msg) != ESP_OK) {
+            ret = send_json_error(req, "400 Bad Request", msg ? msg : "保存失败");
+        } else {
+            httpd_resp_set_type(req, "application/json");
+            ret = httpd_resp_sendstr(req, "{\"ok\":true}");
+        }
+    } else if (strcmp(action, "del") == 0) {
+        if (h2_routes_del(path) != ESP_OK) {
+            ret = send_json_error(req, "404 Not Found", "没有该路径");
+        } else {
+            httpd_resp_set_type(req, "application/json");
+            ret = httpd_resp_sendstr(req, "{\"ok\":true}");
+        }
+    } else {
+        ret = send_json_error(req, "400 Bad Request", "action 须为 set 或 del");
+    }
+    free(action);
+    free(path);
+    free(json);
+    return ret;
+}
+
 esp_err_t web_server_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 10;
+    cfg.max_uri_handlers = 12;
     cfg.lru_purge_enable = true;
     cfg.stack_size = 6144;
 
@@ -356,6 +473,8 @@ esp_err_t web_server_start(void)
         { .uri = "/api/scan",    .method = HTTP_GET,  .handler = scan_get },
         { .uri = "/api/log",     .method = HTTP_GET,  .handler = log_get },
         { .uri = "/api/restart", .method = HTTP_POST, .handler = restart_post },
+        { .uri = "/api/h2routes", .method = HTTP_GET,  .handler = h2routes_get },
+        { .uri = "/api/h2routes", .method = HTTP_POST, .handler = h2routes_post },
         { .uri = "/ws",          .method = HTTP_GET,  .handler = ws_handler, .is_websocket = true,
           .ws_post_handshake_cb = ws_post_handshake },
     };

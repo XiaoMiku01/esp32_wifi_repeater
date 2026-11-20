@@ -20,6 +20,7 @@
 #include "esp_system.h"
 #include "nvs_flash.h"
 #include "repeater.h"
+#include "h2_routes.h"
 
 #define RECONNECT_DELAY_MS  3000
 #define APPLY_DELAY_MS      500   /* 先让 HTTP 响应发出去再动 Wi-Fi */
@@ -279,6 +280,7 @@ void app_main(void)
     s_cfg_lock = xSemaphoreCreateMutex();
     s_scan_lock = xSemaphoreCreateMutex();
     repeater_cfg_load(&s_cfg);
+    h2_routes_init();
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());

@@ -6,6 +6,7 @@
  *   GET  /status    中继运行状态 JSON
  *   GET  /headers   回显请求头（验证 HPACK）
  *   POST /echo      原样回显请求体
+ *   其他路径        按配置页设置的自定义接口应答 JSON（见 h2_routes.c），否则 404
  *
  * 测试（连在 ESP32 热点上）：curl --http2 https://www.aabbcc.com/ping
  */
@@ -14,6 +15,7 @@
 #include "esp_timer.h"
 #include "h2_server.h"
 #include "repeater.h"
+#include "h2_routes.h"
 
 static const char *TAG = "h2_test";
 
@@ -96,6 +98,20 @@ static esp_err_t echo_post(h2_req_t *req)
     return h2_resp_send(req, 200, ct ? ct : "application/octet-stream", body, len);
 }
 
+static void send_custom_json(const char *json, void *arg)
+{
+    h2_resp_sendstr(arg, 200, "application/json; charset=utf-8", json);
+}
+
+/* 兜底路由：查自定义接口表（任意方法） */
+static esp_err_t custom_handler(h2_req_t *req)
+{
+    if (h2_routes_with(h2_req_path(req), send_custom_json, req)) {
+        return ESP_OK;
+    }
+    return h2_resp_sendstr(req, 404, "text/plain", "not found\n");
+}
+
 esp_err_t h2_test_start(void)
 {
     h2_server_config_t cfg = H2_SERVER_DEFAULT_CONFIG();
@@ -118,6 +134,7 @@ esp_err_t h2_test_start(void)
         { "GET",  "/status",  status_get,  NULL },
         { "GET",  "/headers", headers_get, NULL },
         { "POST", "/echo",    echo_post,   NULL },
+        { NULL,   "/*",       custom_handler, NULL },   /* 须最后注册，内置接口优先 */
     };
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
         h2_server_register(srv, &routes[i]);

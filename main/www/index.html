@@ -67,6 +67,23 @@
   .bars i.on { background:var(--accent); }
   .bars i:nth-child(1){height:25%} .bars i:nth-child(2){height:50%}
   .bars i:nth-child(3){height:75%} .bars i:nth-child(4){height:100%}
+  textarea { width:100%; min-height:140px; padding:6px 8px; border:1px solid var(--line); border-radius:4px;
+             background:var(--bg); color:var(--fg); font:12px/1.45 ui-monospace,Menlo,Consolas,monospace;
+             resize:vertical; }
+  .prefix-row { display:flex; align-items:center; border:1px solid var(--line); border-radius:4px;
+                background:var(--bg); }
+  .prefix-row span { padding:0 0 0 8px; color:var(--muted); white-space:nowrap; font-size:12px; }
+  .prefix-row input { border:none; background:transparent; min-width:0; flex:1; }
+  #rtList { list-style:none; margin:0 0 10px; padding:0; border:1px solid var(--line); border-radius:4px; }
+  #rtList:empty { display:none; }
+  #rtList li { display:flex; align-items:center; gap:8px; padding:6px 8px; border-bottom:1px solid var(--line); }
+  #rtList li:last-child { border-bottom:none; }
+  #rtList .p { font-family:ui-monospace,Menlo,Consolas,monospace; overflow:hidden; text-overflow:ellipsis;
+               white-space:nowrap; }
+  #rtList .j { flex:1; min-width:0; color:var(--muted); font-size:12px; overflow:hidden;
+               text-overflow:ellipsis; white-space:nowrap; font-family:ui-monospace,Menlo,Consolas,monospace; }
+  #rtList button { padding:3px 8px; font-size:12px; }
+  #rtMsg.ok { color:var(--ok); } #rtMsg.bad { color:var(--bad); }
 </style>
 </head>
 <body>
@@ -124,6 +141,26 @@
         </div>
         <div id="msg"></div>
         <p class="muted">修改本机热点后，已连接的设备会断开，需要用新 SSID/密码重新连接。</p>
+      </form>
+    </section>
+
+    <section class="card">
+      <h2>HTTP/2 自定义接口 <span class="muted" id="rtSite"></span></h2>
+      <ul id="rtList"></ul>
+      <p class="muted" id="rtEmpty">还没有自定义接口。</p>
+      <form id="rtForm" autocomplete="off">
+        <label for="rtPath">路径</label>
+        <div class="prefix-row"><span id="rtPrefix">https://…</span>
+          <input type="text" id="rtPath" maxlength="64" placeholder="/api/hello" required></div>
+        <label for="rtJson">应答 JSON</label>
+        <textarea id="rtJson" spellcheck="false" placeholder='{"hello": "world"}' required></textarea>
+        <div class="muted" id="rtSize"></div>
+        <div class="row" style="margin-top:8px">
+          <button type="submit" class="primary">保存接口</button>
+          <button type="button" id="rtFmt">格式化</button>
+          <button type="button" id="rtNew">清空</button>
+        </div>
+        <div id="rtMsg"></div>
       </form>
     </section>
   </div>
@@ -271,6 +308,83 @@ async function scan() {
   }
 }
 $('scanBtn').onclick = scan;
+
+
+/* ---------- HTTP/2 自定义接口 ---------- */
+let rtInfo = { max: 8, max_json: 1024, routes: [] };
+const utf8Len = t => new TextEncoder().encode(t).length;
+function rtShowMsg(t, ok) { const m = $('rtMsg'); m.textContent = t; m.className = ok ? 'ok' : 'bad'; }
+function rtCompact() {
+  const text = $('rtJson').value.trim();
+  if (!text) throw new Error('JSON 不能为空');
+  let obj;
+  try { obj = JSON.parse(text); } catch (e) { throw new Error('JSON 格式错误：' + e.message); }
+  return JSON.stringify(obj);
+}
+function rtUpdateSize() {
+  let t;
+  try { t = rtCompact(); } catch (e) { $('rtSize').textContent = $('rtJson').value.trim() ? e.message : ''; return; }
+  const n = utf8Len(t);
+  $('rtSize').textContent = `压缩后 ${n} / ${rtInfo.max_json} 字节` + (n > rtInfo.max_json ? '（超出上限）' : '');
+}
+function rtEdit(r) {
+  $('rtPath').value = r.path;
+  try { $('rtJson').value = JSON.stringify(JSON.parse(r.json), null, 2); } catch (e) { $('rtJson').value = r.json; }
+  rtUpdateSize(); rtShowMsg('', true);
+}
+function rtRender() {
+  const ul = $('rtList'); ul.textContent = '';
+  const base = `https://${rtInfo.domain}${rtInfo.port === 443 ? '' : ':' + rtInfo.port}`;
+  $('rtSite').textContent = `${base}（${rtInfo.routes.length}/${rtInfo.max}）`;
+  $('rtPrefix').textContent = base;
+  $('rtEmpty').style.display = rtInfo.routes.length ? 'none' : '';
+  for (const r of rtInfo.routes) {
+    const li = document.createElement('li');
+    const p = document.createElement('span'); p.className = 'p'; p.textContent = r.path;
+    const j = document.createElement('span'); j.className = 'j'; j.textContent = r.json; j.title = r.json;
+    const ed = document.createElement('button'); ed.type = 'button'; ed.textContent = '编辑'; ed.onclick = () => rtEdit(r);
+    const del = document.createElement('button'); del.type = 'button'; del.textContent = '删除';
+    del.onclick = async () => {
+      if (!confirm(`删除接口 ${r.path}？`)) return;
+      try { await rtPost({ action: 'del', path: r.path }); rtShowMsg(`已删除 ${r.path}`, true); await rtLoad(); }
+      catch (e) { rtShowMsg(e.message, false); }
+    };
+    li.append(p, j, ed, del);
+    ul.appendChild(li);
+  }
+}
+async function rtLoad() {
+  rtInfo = await (await fetch('/api/h2routes', { cache: 'no-store' })).json();
+  rtRender();
+}
+async function rtPost(fields) {
+  const r = await fetch('/api/h2routes', { method: 'POST', body: new URLSearchParams(fields) });
+  let j = {};
+  try { j = await r.json(); } catch (e) {}
+  if (!r.ok || !j.ok) throw new Error(j.error || `请求失败（${r.status}）`);
+}
+$('rtJson').oninput = rtUpdateSize;
+$('rtFmt').onclick = () => {
+  try { $('rtJson').value = JSON.stringify(JSON.parse(rtCompact()), null, 2); rtShowMsg('', true); }
+  catch (e) { rtShowMsg(e.message, false); }
+};
+$('rtNew').onclick = () => { $('rtPath').value = ''; $('rtJson').value = ''; rtUpdateSize(); rtShowMsg('', true); };
+$('rtForm').onsubmit = async ev => {
+  ev.preventDefault();
+  let path = $('rtPath').value.trim();
+  if (path && !path.startsWith('/')) path = '/' + path;
+  if (!/^\/[\x21-\x7e]{1,63}$/.test(path) || /[?#*]/.test(path)) { rtShowMsg('路径须以 / 开头，2-64 个 ASCII 可见字符，不能包含 ?、#、*', false); return; }
+  let json;
+  try { json = rtCompact(); } catch (e) { rtShowMsg(e.message, false); return; }
+  if (utf8Len(json) > rtInfo.max_json) { rtShowMsg(`JSON 超过 ${rtInfo.max_json} 字节`, false); return; }
+  try {
+    await rtPost({ action: 'set', path, json });
+    $('rtPath').value = path;
+    rtShowMsg(`已保存，访问 https://${rtInfo.domain}${path}`, true);
+    await rtLoad();
+  } catch (e) { rtShowMsg(e.message, false); }
+};
+rtLoad().catch(() => rtShowMsg('读取自定义接口失败', false));
 
 loadConfig().catch(() => showMsg('读取配置失败', false)).then(scan);
 

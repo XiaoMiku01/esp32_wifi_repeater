@@ -8,7 +8,7 @@ foreach(f ${H2_CERT} ${H2_KEY})
 endforeach()
 
 idf_component_register(SRCS "wifi_repeater.c" "repeater_config.c" "web_log.c" "web_server.c"
-                            "dns_relay.c" "h2_test.c"
+                            "dns_relay.c" "h2_test.c" "h2_routes.c"
                     PRIV_REQUIRES esp_wifi esp_netif nvs_flash esp_psram esp_http_server esp_timer
                                   esp_ringbuf h2_server
                     INCLUDE_DIRS "."
