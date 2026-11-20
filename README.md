@@ -46,23 +46,17 @@
 
 需要 ESP-IDF v6.1.x。
 
-1. 准备 HTTPS 站点证书（不入库，构建时嵌入固件；缺失时构建会报错）：
+1. （可选）准备 HTTPS 站点证书。证书不入库，构建时嵌入固件：
 
    ```
    main/certs2/www.aabbcc.com.fullchain.pem   # 证书链（PEM，含中间证书）
    main/certs2/www.aabbcc.com.key             # 私钥（PEM，未加密）
    ```
 
-   只是试用的话可以生成一张自签证书（浏览器会提示不受信任）：
-
-   ```bash
-   mkdir -p main/certs2
-   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 365 \
-     -subj "/CN=www.aabbcc.com" -addext "subjectAltName=DNS:www.aabbcc.com" \
-     -keyout main/certs2/www.aabbcc.com.key -out main/certs2/www.aabbcc.com.fullchain.pem
-   ```
-
-   默认域名在 `main/repeater.h` 的 `H2_SITE_DEFAULT_DOMAIN`；烧录后也可在网页上换成自己的域名和证书。
+   **没有这两个文件也能编译**：构建时会用 openssl 在 `build/h2_selfsigned/` 生成一张自签证书
+   （RSA-2048，有效期 10 年，域名为 `main/repeater.h` 中的 `H2_SITE_DEFAULT_DOMAIN`），
+   并给出警告。自签证书在浏览器里会提示不受信任；需要 openssl（OpenSSL 或 LibreSSL 均可）。
+   烧录后也可以在配置页换成自己的域名和证书。
 
 2. 编译并烧录：
 
