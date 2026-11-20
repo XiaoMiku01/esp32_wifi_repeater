@@ -10,7 +10,8 @@
 /* 从 NVS 加载，须在 h2 站点和配置页启动前调用 */
 void h2_routes_init(void);
 /* 路径匹配：先按 h2_server 规则规范化（百分号解码、合并连续斜杠、去掉结尾斜杠），
- * 不区分大小写、不区分请求方法；按后缀整段匹配，/abc 命中 /abc、/a/abc、/b/abc，
+ * 不区分大小写、不区分请求方法；配置路径在请求路径中任意位置整段出现即命中：
+ * /abc 命中 /abc、/a/abc、/abc/x、/a/abc/x，不命中 /xabc、/abcx；
  * 多条命中取最长的一条。保存时路径会被规范化，与已有路径等价时覆盖原条目 */
 /* 新增或覆盖；失败时 err_msg 给出原因 */
 esp_err_t h2_routes_set(const char *path, const char *json, const char **err_msg);

@@ -199,8 +199,8 @@
         <label for="rtJson">应答 JSON</label>
         <textarea id="rtJson" spellcheck="false" placeholder='{"hello": "world"}' required></textarea>
         <div class="muted" id="rtSize"></div>
-        <p class="muted">匹配规则：不区分请求方法和大小写，忽略结尾斜杠和查询串；按结尾整段匹配，
-          设置 /abc 时 /abc、/a/abc、/b/abc 都会命中，多条命中时取最长的一条。</p>
+        <p class="muted">匹配规则：不区分请求方法和大小写，忽略结尾斜杠和查询串；路径中任意位置整段出现即命中，
+          设置 /abc 时 /abc、/a/abc、/abc/x、/a/abc/x 都会命中（/xabc、/abcx 不命中），多条命中时取最长的一条。</p>
         <div class="row" style="margin-top:8px">
           <button type="submit" class="primary">保存接口</button>
           <button type="button" id="rtFmt">格式化</button>

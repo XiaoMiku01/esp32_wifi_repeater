@@ -242,9 +242,21 @@ esp_err_t h2_routes_del(const char *path_in)
     return err;
 }
 
-/* 后缀匹配：配置路径是请求路径的结尾（按整段匹配）即命中。
- * 配置路径以 '/' 开头，所以尾部比较天然落在段边界上：/abc 命中 /abc、/a/abc，不命中 /xabc。
- * 多条命中时取最长（最具体）的一条，因此完全相同的路径优先 */
+/* 配置路径（以 '/' 开头）在请求路径中的位置 k 处出现，且其后是 '\0' 或 '/'，即为整段命中。
+ * 起点必为 '/'，终点检查保证不会切在段中间：
+ *   /abc 命中 /abc、/a/abc、/abc/x、/a/abc/x；不命中 /xabc、/abcx */
+static bool contains_segments(const char *req, size_t rlen, const char *pat, size_t plen)
+{
+    for (size_t k = 0; k + plen <= rlen; k++) {
+        if (req[k] == '/' && strncasecmp(req + k, pat, plen) == 0 &&
+            (req[k + plen] == '\0' || req[k + plen] == '/')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* 任意位置整段匹配；多条命中时取最长（最具体）的一条，因此完全相同的路径优先 */
 bool h2_routes_with(const char *path, void (*fn)(const char *json, const char *md5, void *arg), void *arg)
 {
     size_t rlen = strlen(path);
@@ -256,7 +268,7 @@ bool h2_routes_with(const char *path, void (*fn)(const char *json, const char *m
             continue;
         }
         size_t plen = strlen(s_tab[i].path);
-        if (plen <= rlen && plen > best_len && strcasecmp(path + rlen - plen, s_tab[i].path) == 0) {
+        if (plen > best_len && contains_segments(path, rlen, s_tab[i].path, plen)) {
             best = i;
             best_len = plen;
         }

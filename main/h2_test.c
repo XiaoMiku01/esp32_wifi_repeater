@@ -7,7 +7,7 @@
  *   GET  /status    中继运行状态 JSON
  *   GET  /headers   回显请求头（验证 HPACK）
  *   POST /echo      原样回显请求体
- *   其他路径        按配置页设置的自定义接口应答 JSON（后缀整段匹配，见 h2_routes.h），否则 404
+ *   其他路径        按配置页设置的自定义接口应答 JSON（任意位置整段匹配，见 h2_routes.h），否则 404
  *   以上路径均不区分方法和大小写，忽略结尾斜杠
  *
  * 测试（连在 ESP32 热点上）：curl --http2 https://www.aabbcc.com/ping
