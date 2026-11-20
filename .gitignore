@@ -1,0 +1,12 @@
+# 构建产物
+build/
+# 由 sdkconfig.defaults 生成，配置以 defaults 为准
+sdkconfig
+sdkconfig.old
+# 组件管理器
+managed_components/
+dependencies.lock
+# 编辑器 / 系统
+.cache/
+.vscode/
+.DS_Store

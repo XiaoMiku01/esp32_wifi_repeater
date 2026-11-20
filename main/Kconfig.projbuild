@@ -1,0 +1,24 @@
+menu "Wi-Fi Repeater"
+
+    config REPEATER_STA_SSID
+        string "上游路由器 SSID"
+        default "upstream_ssid"
+
+    config REPEATER_STA_PASSWORD
+        string "上游路由器密码（开放网络留空）"
+        default "upstream_password"
+
+    config REPEATER_AP_SSID
+        string "本机 AP SSID"
+        default "ESP32-Repeater"
+
+    config REPEATER_AP_PASSWORD
+        string "本机 AP 密码（>=8 位，留空为开放网络）"
+        default "12345678"
+
+    config REPEATER_AP_MAX_CONN
+        int "AP 最大客户端数"
+        range 1 15
+        default 8
+
+endmenu

@@ -1,0 +1,369 @@
+/*
+ * 配置页 HTTP 服务
+ *   GET  /             配置页（main/www/index.html）
+ *   GET  /api/status   运行状态 JSON
+ *   GET  /api/config   当前配置 JSON（不返回密码）
+ *   POST /api/config   保存并应用配置，表单编码
+ *   GET  /api/scan     扫描周边网络（阻塞约 2-3 秒）
+ *   POST /api/restart  重启
+ *   GET  /ws           WebSocket，推送实时日志（二进制帧，UTF-8 文本）
+ */
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_http_server.h"
+#include "esp_log.h"
+#include "esp_system.h"
+#include "repeater.h"
+#include "web_log_priv.h"
+
+static const char *TAG = "web";
+static httpd_handle_t s_server;
+
+extern const char index_html_start[] asm("_binary_index_html_start");
+extern const char index_html_end[]   asm("_binary_index_html_end");
+
+/* ---------- 工具函数 ---------- */
+
+/* 把 s 以 JSON 字符串形式（含引号）写入 out，返回写入长度 */
+static size_t json_str(char *out, size_t cap, const char *s)
+{
+    size_t o = 0;
+    if (cap < 3) {
+        return 0;
+    }
+    out[o++] = '"';
+    for (; *s && o + 7 < cap; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\') {
+            out[o++] = '\\';
+            out[o++] = c;
+        } else if (c < 0x20) {
+            o += snprintf(out + o, cap - o, "\\u%04x", c);
+        } else {
+            out[o++] = c;
+        }
+    }
+    out[o++] = '"';
+    out[o] = '\0';
+    return o;
+}
+
+static int hexval(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* application/x-www-form-urlencoded 解码；输出超长返回 false */
+static bool url_decode(const char *in, char *out, size_t cap)
+{
+    size_t o = 0;
+    for (; *in; in++) {
+        char c = *in;
+        if (c == '+') {
+            c = ' ';
+        } else if (c == '%' && in[1] && in[2]) {
+            int h = hexval(in[1]), l = hexval(in[2]);
+            if (h < 0 || l < 0) {
+                return false;
+            }
+            c = (char)(h << 4 | l);
+            in += 2;
+        }
+        if (o + 1 >= cap) {
+            return false;
+        }
+        out[o++] = c;
+    }
+    out[o] = '\0';
+    return true;
+}
+
+/* 读取表单字段：不存在返回 0，成功返回 1，非法/超长返回 -1 */
+static int form_get(const char *body, const char *key, char *out, size_t cap)
+{
+    char raw[200];
+    esp_err_t err = httpd_query_key_value(body, key, raw, sizeof(raw));
+    if (err == ESP_ERR_NOT_FOUND) {
+        return 0;
+    }
+    if (err != ESP_OK) {
+        return -1;
+    }
+    return url_decode(raw, out, cap) ? 1 : -1;
+}
+
+static esp_err_t send_json_error(httpd_req_t *req, const char *status, const char *msg)
+{
+    char buf[200], m[160];
+    json_str(m, sizeof(m), msg);
+    snprintf(buf, sizeof(buf), "{\"ok\":false,\"error\":%s}", m);
+    httpd_resp_set_status(req, status);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, buf);
+}
+
+/* ---------- HTTP 处理 ---------- */
+
+static esp_err_t index_get(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    /* EMBED_TXTFILES 末尾附加了 '\0'，不发送 */
+    return httpd_resp_send(req, index_html_start, index_html_end - index_html_start - 1);
+}
+
+static esp_err_t status_get(httpd_req_t *req)
+{
+    repeater_status_t st;
+    repeater_get_status(&st);
+    char buf[320];
+    snprintf(buf, sizeof(buf),
+             "{\"sta_connected\":%s,\"sta_ip\":\"%s\",\"sta_gw\":\"%s\",\"ap_ip\":\"%s\","
+             "\"rssi\":%d,\"channel\":%u,\"clients\":%d,\"uptime\":%lu,\"free_heap\":%lu}",
+             st.sta_connected ? "true" : "false", st.sta_ip, st.sta_gw, st.ap_ip,
+             st.rssi, st.channel, st.clients,
+             (unsigned long)st.uptime_s, (unsigned long)st.free_heap);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, buf);
+}
+
+static esp_err_t config_get(httpd_req_t *req)
+{
+    repeater_cfg_t c;
+    repeater_get_cfg(&c);
+    char sta[80], ap[80], buf[320];
+    json_str(sta, sizeof(sta), c.sta_ssid);
+    json_str(ap, sizeof(ap), c.ap_ssid);
+    snprintf(buf, sizeof(buf),
+             "{\"sta_ssid\":%s,\"sta_has_pass\":%s,\"ap_ssid\":%s,\"ap_has_pass\":%s,\"ap_max_conn\":%u}",
+             sta, c.sta_pass[0] ? "true" : "false",
+             ap, c.ap_pass[0] ? "true" : "false", c.ap_max_conn);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, buf);
+}
+
+static esp_err_t config_post(httpd_req_t *req)
+{
+    char body[768];
+    if (req->content_len >= sizeof(body)) {
+        return send_json_error(req, "413 Payload Too Large", "请求过大");
+    }
+    size_t got = 0;
+    while (got < req->content_len) {
+        int r = httpd_req_recv(req, body + got, req->content_len - got);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+            continue;
+        }
+        if (r <= 0) {
+            return ESP_FAIL;
+        }
+        got += r;
+    }
+    body[got] = '\0';
+
+    /* 以当前配置为基础：密码字段为空表示不修改，*_open=1 表示改为开放网络 */
+    repeater_cfg_t c;
+    repeater_get_cfg(&c);
+    char tmp[80];
+    int r;
+
+    if ((r = form_get(body, "sta_ssid", c.sta_ssid, sizeof(c.sta_ssid))) < 0) {
+        return send_json_error(req, "400 Bad Request", "上游 SSID 过长");
+    }
+    if ((r = form_get(body, "sta_pass", tmp, sizeof(c.sta_pass))) < 0) {
+        return send_json_error(req, "400 Bad Request", "上游密码过长");
+    } else if (r > 0 && tmp[0]) {
+        strlcpy(c.sta_pass, tmp, sizeof(c.sta_pass));
+    }
+    if (form_get(body, "sta_open", tmp, sizeof(tmp)) > 0 && strcmp(tmp, "1") == 0) {
+        c.sta_pass[0] = '\0';
+    }
+
+    if ((r = form_get(body, "ap_ssid", c.ap_ssid, sizeof(c.ap_ssid))) < 0) {
+        return send_json_error(req, "400 Bad Request", "AP SSID 过长");
+    }
+    if ((r = form_get(body, "ap_pass", tmp, sizeof(c.ap_pass))) < 0) {
+        return send_json_error(req, "400 Bad Request", "AP 密码过长");
+    } else if (r > 0 && tmp[0]) {
+        strlcpy(c.ap_pass, tmp, sizeof(c.ap_pass));
+    }
+    if (form_get(body, "ap_open", tmp, sizeof(tmp)) > 0 && strcmp(tmp, "1") == 0) {
+        c.ap_pass[0] = '\0';
+    }
+    if (form_get(body, "ap_max_conn", tmp, sizeof(tmp)) > 0) {
+        int v = atoi(tmp);
+        c.ap_max_conn = (v >= 1 && v <= 15) ? v : 0; /* 0 会被校验拒绝 */
+    }
+
+    const char *msg = NULL;
+    if (repeater_set_cfg(&c, &msg) != ESP_OK) {
+        return send_json_error(req, "400 Bad Request", msg ? msg : "保存失败");
+    }
+    ESP_LOGI(TAG, "配置已保存");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
+#define SCAN_MAX 30
+
+static esp_err_t scan_get(httpd_req_t *req)
+{
+    repeater_scan_item_t *items = calloc(SCAN_MAX, sizeof(*items));
+    if (!items) {
+        return send_json_error(req, "500 Internal Server Error", "内存不足");
+    }
+    int n = repeater_scan(items, SCAN_MAX);
+    if (n < 0) {
+        free(items);
+        return send_json_error(req, "503 Service Unavailable", "扫描失败，请稍后重试");
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr_chunk(req, "{\"ok\":true,\"aps\":[");
+    char buf[160], ssid[80];
+    for (int i = 0; i < n; i++) {
+        json_str(ssid, sizeof(ssid), items[i].ssid);
+        snprintf(buf, sizeof(buf), "%s{\"ssid\":%s,\"rssi\":%d,\"channel\":%u,\"open\":%s}",
+                 i ? "," : "", ssid, items[i].rssi, items[i].channel, items[i].open ? "true" : "false");
+        httpd_resp_sendstr_chunk(req, buf);
+    }
+    httpd_resp_sendstr_chunk(req, "]}");
+    free(items);
+    return httpd_resp_sendstr_chunk(req, NULL);
+}
+
+static void restart_task(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+}
+
+static esp_err_t restart_post(httpd_req_t *req)
+{
+    ESP_LOGW(TAG, "收到重启请求");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    xTaskCreate(restart_task, "restart", 2048, NULL, 5, NULL);
+    return ESP_OK;
+}
+
+/* ---------- WebSocket 日志 ---------- */
+
+static void ws_send_fd(void *ctx, const char *data, size_t len)
+{
+    int fd = (int)(intptr_t)ctx;
+    httpd_ws_frame_t f = {
+        .type = HTTPD_WS_TYPE_BINARY,  /* 分块可能切断 UTF-8 字符，用二进制帧由浏览器流式解码 */
+        .payload = (uint8_t *)data,
+        .len = len,
+        .final = true,
+    };
+    esp_err_t err = httpd_ws_send_frame_async(s_server, fd, &f);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "WS 发送失败 fd=%d len=%u: %s", fd, (unsigned)len, esp_err_to_name(err));
+    }
+}
+
+/* 广播给所有 WS 客户端（由日志推送任务调用） */
+static void ws_broadcast(void *ctx, const char *data, size_t len)
+{
+    if (!s_server) {
+        return;
+    }
+    int fds[CONFIG_LWIP_MAX_SOCKETS];
+    size_t n = sizeof(fds) / sizeof(fds[0]);
+    if (httpd_get_client_list(s_server, &n, fds) != ESP_OK) {
+        return;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (httpd_ws_get_fd_info(s_server, fds[i]) == HTTPD_WS_CLIENT_WEBSOCKET) {
+            ws_send_fd((void *)(intptr_t)fds[i], data, len);
+        }
+    }
+}
+
+static void ws_send_history_work(void *arg)
+{
+    ESP_LOGI(TAG, "WS 客户端 fd=%d 已连接，发送历史日志", (int)(intptr_t)arg);
+    web_log_send_history(ws_send_fd, arg);
+}
+
+/* 纯文本历史日志，便于不用 WebSocket 时查看 */
+static void http_chunk_sink(void *ctx, const char *data, size_t len)
+{
+    httpd_resp_send_chunk((httpd_req_t *)ctx, data, len);
+}
+
+static esp_err_t log_get(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    web_log_send_history(http_chunk_sink, req);
+    return httpd_resp_send_chunk(req, NULL, 0);
+}
+
+/* IDF 6.x 握手时不再调用 handler，用握手后回调发送历史日志 */
+static esp_err_t ws_post_handshake(httpd_req_t *req)
+{
+    int fd = httpd_req_to_sockfd(req);
+    /* 排队到 httpd 任务，确保 101 响应已发出 */
+    return httpd_queue_work(req->handle, ws_send_history_work, (void *)(intptr_t)fd);
+}
+
+static esp_err_t ws_handler(httpd_req_t *req)
+{
+    if (req->method == HTTP_GET) {
+        return ESP_OK;
+    }
+    /* 客户端发来的数据帧：读出丢弃 */
+    httpd_ws_frame_t f = { 0 };
+    esp_err_t err = httpd_ws_recv_frame(req, &f, 0);
+    if (err != ESP_OK || f.len == 0) {
+        return err;
+    }
+    uint8_t *buf = malloc(f.len);
+    if (!buf) {
+        return ESP_ERR_NO_MEM;
+    }
+    f.payload = buf;
+    err = httpd_ws_recv_frame(req, &f, f.len);
+    free(buf);
+    return err;
+}
+
+esp_err_t web_server_start(void)
+{
+    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    cfg.max_uri_handlers = 10;
+    cfg.lru_purge_enable = true;
+    cfg.stack_size = 6144;
+
+    esp_err_t err = httpd_start(&s_server, &cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "httpd_start 失败: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    const httpd_uri_t uris[] = {
+        { .uri = "/",            .method = HTTP_GET,  .handler = index_get },
+        { .uri = "/api/status",  .method = HTTP_GET,  .handler = status_get },
+        { .uri = "/api/config",  .method = HTTP_GET,  .handler = config_get },
+        { .uri = "/api/config",  .method = HTTP_POST, .handler = config_post },
+        { .uri = "/api/scan",    .method = HTTP_GET,  .handler = scan_get },
+        { .uri = "/api/log",     .method = HTTP_GET,  .handler = log_get },
+        { .uri = "/api/restart", .method = HTTP_POST, .handler = restart_post },
+        { .uri = "/ws",          .method = HTTP_GET,  .handler = ws_handler, .is_websocket = true,
+          .ws_post_handshake_cb = ws_post_handshake },
+    };
+    for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
+        httpd_register_uri_handler(s_server, &uris[i]);
+    }
+
+    web_log_set_sink(ws_broadcast);
+    ESP_LOGI(TAG, "Web 配置页已启动，端口 %d", cfg.server_port);
+    return ESP_OK;
+}
