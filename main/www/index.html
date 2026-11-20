@@ -97,7 +97,7 @@
   #msg, #ovMsg, #rtMsg, #dnsMsg, #siteMsg, #dfMsg, #bkMsg { margin-top:8px; min-height:1.2em; }
   @media (max-width: 760px) {
     .card { padding:12px; border-radius:8px; }
-    input[type=text], input[type=password], input[type=number], textarea { font-size:16px; }  /* 避免 iOS 聚焦放大 */
+    input[type=text], input[type=password], input[type=number], textarea, select { font-size:16px; }  /* 避免 iOS 聚焦放大 */
     textarea { font-size:13px; }
     button { padding:9px 14px; }
   }
@@ -106,14 +106,10 @@
   .ssid-row { display:flex; gap:6px; }
   .ssid-row input { flex:1; min-width:0; width:auto; }
   .ssid-row button { white-space:nowrap; }
-  #scanList { list-style:none; margin:6px 0 0; padding:0; max-height:240px; overflow:auto;
-              border:1px solid var(--line); border-radius:6px; }
-  #scanList:empty { display:none; }
-  #scanList li { display:flex; align-items:center; gap:8px; padding:8px 10px; cursor:pointer; border-bottom:1px solid var(--line); }
-  #scanList li:last-child { border-bottom:none; }
-  #scanList li:hover, #scanList li.sel { background:var(--hover); }
-  #scanList .name { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  #scanList .meta { color:var(--muted); font-size:12px; white-space:nowrap; }
+  select { width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:6px;
+           background:var(--bg); color:var(--fg); font:inherit; }
+  #scanSel { margin-top:6px; }
+  #scanSel[hidden] { display:none; }
   .bars { display:inline-flex; align-items:flex-end; gap:2px; height:14px; }
   .bars i { width:3px; background:var(--line); border-radius:1px; }
   .bars i.on { background:var(--accent); }
@@ -248,8 +244,8 @@
             <input type="text" id="sta_ssid" name="sta_ssid" maxlength="32" required>
             <button type="button" id="scanBtn">扫描</button>
           </div>
-          <ul id="scanList"></ul>
-          <div id="scanMsg" class="muted"></div>
+          <select id="scanSel" hidden></select>
+          <div id="scanMsg" class="muted">可直接输入 SSID（含隐藏网络），或点「扫描」从附近网络中选择</div>
           <label for="sta_pass">密码</label>
           <input type="password" id="sta_pass" name="sta_pass" maxlength="64">
           <label class="check"><input type="checkbox" id="sta_open">开放网络（无密码）</label>
@@ -493,43 +489,49 @@ $('restartBtn').onclick = async () => {
   catch (e) { m.textContent = '请求失败：' + e; m.className = 'bad'; }
 };
 
-/* ---------- 扫描上游 ---------- */
+/* ---------- 扫描上游（点击后扫描，结果放下拉菜单；SSID 输入框仍可自由填写） ---------- */
 function rssiLevel(r) { return r >= -55 ? 4 : r >= -67 ? 3 : r >= -78 ? 2 : 1; }
+const RSSI_BARS = ['▂', '▂▄', '▂▄▆', '▂▄▆█'];
+let scanAps = [];
 function renderScan(aps) {
-  const ul = $('scanList');
-  ul.textContent = '';
-  for (const ap of aps) {
-    const li = document.createElement('li');
-    const lv = rssiLevel(ap.rssi);
-    const bars = document.createElement('span');
-    bars.className = 'bars';
-    bars.title = ap.rssi + ' dBm';
-    for (let i = 1; i <= 4; i++) { const b = document.createElement('i'); if (i <= lv) b.className = 'on'; bars.appendChild(b); }
-    const name = document.createElement('span'); name.className = 'name'; name.textContent = ap.ssid;
-    const meta = document.createElement('span'); meta.className = 'meta';
-    meta.textContent = `${ap.rssi} dBm · 信道 ${ap.channel}${ap.open ? ' · 开放' : ' · 🔒'}`;
-    li.append(bars, name, meta);
-    if (ap.ssid === $('sta_ssid').value) li.className = 'sel';
-    li.onclick = () => {
-      $('sta_ssid').value = ap.ssid;
-      [...ul.children].forEach(x => x.className = '');
-      li.className = 'sel';
-      $('sta_open').checked = ap.open;
-      $('sta_open').onchange && $('sta_open').onchange();
-      if (!ap.open) { $('sta_pass').placeholder = '输入密码'; $('sta_pass').focus(); }
-    };
-    ul.appendChild(li);
-  }
+  scanAps = aps;
+  const sel = $('scanSel');
+  sel.textContent = '';
+  const ph = document.createElement('option');
+  ph.value = ''; ph.textContent = `选择附近的网络（${aps.length} 个）…`;
+  sel.appendChild(ph);
+  aps.forEach((ap, i) => {
+    const o = document.createElement('option');
+    o.value = String(i);
+    o.textContent = `${ap.ssid}　${RSSI_BARS[rssiLevel(ap.rssi) - 1]} ${ap.rssi} dBm · 信道 ${ap.channel} · ${ap.open ? '开放' : '加密'}`;
+    sel.appendChild(o);
+  });
+  const cur = aps.findIndex(ap => ap.ssid === $('sta_ssid').value);
+  sel.value = cur >= 0 ? String(cur) : '';
+  sel.hidden = aps.length === 0;
 }
+$('scanSel').onchange = () => {
+  const ap = scanAps[Number($('scanSel').value)];
+  if (!$('scanSel').value || !ap) return;
+  $('sta_ssid').value = ap.ssid;
+  $('sta_open').checked = ap.open;
+  $('sta_open').onchange && $('sta_open').onchange();
+  if (!ap.open) { $('sta_pass').placeholder = '输入密码'; $('sta_pass').focus(); }
+};
+/* 手动修改 SSID 后，下拉框不再指向扫描结果 */
+$('sta_ssid').addEventListener('input', () => {
+  const i = scanAps.findIndex(ap => ap.ssid === $('sta_ssid').value);
+  $('scanSel').value = i >= 0 ? String(i) : '';
+});
 async function scan() {
   const btn = $('scanBtn');
   btn.disabled = true; btn.textContent = '扫描中…';
-  $('scanMsg').textContent = '';
+  $('scanMsg').textContent = '扫描约需 2-3 秒，期间热点可能短暂卡顿';
   try {
     const j = await (await fetch('/api/scan', { cache: 'no-store' })).json();
     if (!j.ok) throw new Error(j.error);
     renderScan(j.aps);
-    $('scanMsg').textContent = j.aps.length ? `找到 ${j.aps.length} 个网络，点击选择` : '未找到网络';
+    $('scanMsg').textContent = j.aps.length ? `找到 ${j.aps.length} 个网络，从下拉菜单选择，或直接修改 SSID` : '未找到网络，可直接输入 SSID';
   } catch (e) {
     $('scanMsg').textContent = '扫描失败：' + (e.message || e);
   } finally {
@@ -1125,14 +1127,13 @@ loadConfig().catch(() => showMsg('读取配置失败', false));
 
 /* ---------- 标签页 ---------- */
 const TABS = ['overview', 'wifi', 'dns', 'site', 'log', 'backup'];
-let curTab = '', scannedOnce = false;
+let curTab = '';
 function showTab(t) {
   if (!TABS.includes(t)) t = 'overview';
   curTab = t;
   for (const id of TABS) $('tab-' + id).classList.toggle('active', id === t);
   for (const a of document.querySelectorAll('#tabs a[data-tab]')) a.classList.toggle('active', a.dataset.tab === t);
   if (t === 'log') { unread = 0; $('logBadge').textContent = ''; renderLog(); }
-  if (t === 'wifi' && !scannedOnce) { scannedOnce = true; scan(); }   /* 扫描会短暂影响热点，只在首次进入时自动扫描 */
   window.scrollTo(0, 0);
 }
 window.addEventListener('hashchange', () => showTab(location.hash.slice(1)));
