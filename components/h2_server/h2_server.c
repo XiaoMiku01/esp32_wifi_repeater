@@ -625,6 +625,30 @@ esp_err_t h2_server_start(const h2_server_config_t *cfg, h2_server_handle_t *out
     srv->tls_cfg.serverkey_buf = cfg->key_pem;
     srv->tls_cfg.serverkey_bytes = cfg->key_len;
 
+    /* 客户端证书：IGNORE 时不设 CA，esp-tls 不发 CertificateRequest，客户端不会出示证书 */
+    switch (cfg->client_auth) {
+    case H2_CLIENT_AUTH_IGNORE:
+        break;
+    case H2_CLIENT_AUTH_OPTIONAL:
+#ifndef CONFIG_ESP_TLS_SERVER_MIN_AUTH_MODE_OPTIONAL
+        ESP_LOGE(TAG, "OPTIONAL 需开启 CONFIG_ESP_TLS_SERVER_MIN_AUTH_MODE_OPTIONAL");
+        goto fail_arg;
+#else
+        srv->tls_cfg.client_cert_authmode_optional = true;
+#endif
+        /* fallthrough */
+    case H2_CLIENT_AUTH_REQUIRED:
+        if (!cfg->client_ca_pem || !cfg->client_ca_len) {
+            ESP_LOGE(TAG, "校验客户端证书需要提供 client_ca_pem");
+            goto fail_arg;
+        }
+        srv->tls_cfg.cacert_buf = cfg->client_ca_pem;
+        srv->tls_cfg.cacert_bytes = cfg->client_ca_len;
+        break;
+    default:
+        goto fail_arg;
+    }
+
     srv->listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (srv->listen_fd < 0) {
         goto fail_mem;
@@ -646,9 +670,18 @@ esp_err_t h2_server_start(const h2_server_config_t *cfg, h2_server_handle_t *out
         close(srv->listen_fd);
         goto fail_mem;
     }
-    ESP_LOGI(TAG, "HTTP/2 服务已启动，端口 %u（TLS，ALPN h2）", cfg->port);
+    static const char *const auth_name[] = { "忽略", "可选", "必须" };
+    ESP_LOGI(TAG, "HTTP/2 服务已启动，端口 %u（TLS，ALPN h2，客户端证书：%s）",
+             cfg->port, auth_name[cfg->client_auth]);
     *out = srv;
     return ESP_OK;
+
+fail_arg:
+    if (srv->conn_sem) vSemaphoreDelete(srv->conn_sem);
+    if (srv->lock) vSemaphoreDelete(srv->lock);
+    free(srv->routes);
+    free(srv);
+    return ESP_ERR_INVALID_ARG;
 
 fail_mem:
     if (srv->conn_sem) vSemaphoreDelete(srv->conn_sem);

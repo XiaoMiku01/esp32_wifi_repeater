@@ -31,12 +31,23 @@ typedef struct {
     void *user_ctx;
 } h2_route_t;
 
+/* 客户端证书（mTLS）处理方式 */
+typedef enum {
+    H2_CLIENT_AUTH_IGNORE = 0,  /* 默认：不请求客户端证书；客户端配置了 mTLS 也照常连接，证书被忽略 */
+    H2_CLIENT_AUTH_OPTIONAL,    /* 请求并校验，客户端不给证书也放行（需开启
+                                   CONFIG_ESP_TLS_SERVER_MIN_AUTH_MODE_OPTIONAL） */
+    H2_CLIENT_AUTH_REQUIRED,    /* 必须提供由 client_ca 签发的证书，否则握手失败 */
+} h2_client_auth_t;
+
 typedef struct {
     uint16_t port;
     const uint8_t *cert_pem;    /* 服务器证书 PEM，长度含结尾 '\0' */
     size_t cert_len;
     const uint8_t *key_pem;     /* 私钥 PEM，长度含结尾 '\0' */
     size_t key_len;
+    h2_client_auth_t client_auth;   /* 默认 H2_CLIENT_AUTH_IGNORE */
+    const uint8_t *client_ca_pem;   /* OPTIONAL/REQUIRED 时用于校验客户端证书的 CA，长度含 '\0' */
+    size_t client_ca_len;
     uint8_t max_conns;          /* 同时连接数，超出直接关闭 */
     uint32_t max_streams;       /* 每连接并发流（SETTINGS_MAX_CONCURRENT_STREAMS） */
     size_t max_body;            /* 请求体上限，超出回 413 */
@@ -49,6 +60,7 @@ typedef struct {
 
 #define H2_SERVER_DEFAULT_CONFIG() {    \
     .port = 8443,                       \
+    .client_auth = H2_CLIENT_AUTH_IGNORE, \
     .max_conns = 3,                     \
     .max_streams = 8,                   \
     .max_body = 16 * 1024,              \
