@@ -28,6 +28,13 @@
     正文为压缩 JSON
   - 命中时实时日志高亮并弹出提示
 - **配置备份**：导出 / 导入 YAML（Wi-Fi、DNS 自定义解析、HTTPS 站点、自定义接口）
+- **记录页**（`http://192.168.4.1/monitor`，本次开机内的数据，只存内存）
+  - 设备：接入热点的设备、IP、主机名、MAC、实时上下行速率、累计流量、DNS 查询数
+  - 连接：每条连接的类型（按协议与端口）、域名（DNS 应答 / TLS SNI / HTTP Host 识别）、
+    远端地址、实时速率、累计流量
+  - DNS 记录：每条查询及结果（转发 / 本地应答 / 已拦截）与应答 IP
+  - 黑名单（重启后清空）：域名及子域名不再解析（NXDOMAIN），已知 IP 与匹配的连接丢包，
+    已建立的 TCP 连接向客户端发 RST 断开
 
 ## 硬件
 
@@ -111,6 +118,12 @@ curl --http2 https://www.aabbcc.com/ping
 | GET / POST | `/api/h2site` | HTTPS 站点（`action=set&domain=&cert=&key=` / `action=reset`），GET 不返回私钥 |
 | GET | `/api/export` | 导出全部配置 JSON（含密码与私钥） |
 | GET | `/ws` | 实时日志 WebSocket |
+| GET | `/monitor` | 记录页 |
+| GET | `/api/mon/live` | 设备、连接、钩子性能 |
+| GET | `/api/mon/dns?since=<id>` | DNS 记录（增量） |
+| GET / POST | `/api/mon/block` | 黑名单（`action=add&domain=` / `action=del&domain=`） |
+| POST | `/api/mon/ctl` | `action=enable` / `disable` / `reset_perf` |
+| GET | `/api/mon/bench` | 合成包压测转发钩子 |
 
 POST 均为 `application/x-www-form-urlencoded`。
 
@@ -127,8 +140,20 @@ main/
   h2_test.c             HTTPS 站点的路由与内置接口
   h2_routes.c           自定义接口（NVS）
   h2_site.c             站点域名与证书（NVS，热替换）
+  monitor.c             记录与拦截（lwIP 转发钩子）
+  lwip_hook/            注入 lwip 组件的钩子头文件
   www/index.html        配置页
+  www/monitor.html      记录页
 ```
+
+## 记录与拦截的实现与开销
+
+- 通过 `LWIP_HOOK_IP4_CANFORWARD` 在转发路径（NAPT 转换之前）统计与丢包；
+  钩子头文件经 `ESP_IDF_LWIP_HOOK_FILENAME` 只注入 lwip 组件（见 `main/CMakeLists.txt`）
+- 设备上合成包压测（64 条连接、19200 个包）：每包耗时中位数约 7.5 µs，p99 约 9–12 µs
+- 记录页右上角可关闭记录与拦截，钩子随即直接放行
+- 只能看到元数据，HTTPS 内容不可见；共享 IP（CDN）上拉黑可能误伤，
+  DoH 加 ECH 的连接无法识别域名
 
 ## 已知限制
 
