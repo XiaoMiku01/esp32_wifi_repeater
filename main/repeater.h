@@ -54,3 +54,6 @@ void dns_relay_start(esp_netif_t *ap, esp_netif_t *sta);
 
 /* Web 服务（web_server.c） */
 esp_err_t web_server_start(void);
+
+/* HTTP/2 测试接口（h2_test.c），端口 8443 */
+esp_err_t h2_test_start(void);

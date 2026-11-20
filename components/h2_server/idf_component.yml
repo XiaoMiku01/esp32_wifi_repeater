@@ -1,0 +1,4 @@
+description: HTTP/2 server (TLS + ALPN h2) built on esp-tls and nghttp2
+dependencies:
+  idf: ">=6.0"
+  espressif/nghttp: "^1.68.0"

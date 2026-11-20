@@ -310,6 +310,8 @@ void app_main(void)
     dns_relay_start(s_netif_ap, s_netif_sta);
 
     ESP_ERROR_CHECK(web_server_start());
+    /* 测试服务失败不影响中继 */
+    h2_test_start();
 
     ESP_LOGI(TAG, "中继已启动：上游 \"%s\" -> 本机 AP \"%s\"，配置页 http://192.168.4.1/",
              s_cfg.sta_ssid, s_cfg.ap_ssid);
