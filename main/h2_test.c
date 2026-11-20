@@ -95,9 +95,18 @@ static esp_err_t echo_post(h2_req_t *req)
     return h2_resp_send(req, 200, ct ? ct : "application/octet-stream", body, len);
 }
 
-static void send_custom_json(const char *json, void *arg)
+/* 自定义接口应答：
+ *   :status 200
+ *   content-type: application/json
+ *   x-checksum: <md5(body) 小写 hex>
+ *   cache-control: no-store
+ *   正文为压缩 JSON（无空格、无换行） */
+static void send_custom_json(const char *json, const char *md5, void *arg)
 {
-    h2_resp_sendstr(arg, 200, "application/json; charset=utf-8", json);
+    h2_req_t *req = arg;
+    h2_resp_add_header(req, "x-checksum", md5);
+    h2_resp_add_header(req, "cache-control", "no-store");
+    h2_resp_sendstr(req, 200, "application/json", json);
 }
 
 /* 兜底路由：查自定义接口表（任意方法） */

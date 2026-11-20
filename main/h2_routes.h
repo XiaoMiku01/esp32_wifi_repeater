@@ -12,7 +12,8 @@ void h2_routes_init(void);
 /* 新增或覆盖；失败时 err_msg 给出原因 */
 esp_err_t h2_routes_set(const char *path, const char *json, const char **err_msg);
 esp_err_t h2_routes_del(const char *path);
-/* 持锁调用 fn(json)，找不到返回 false；fn 内不要阻塞太久 */
-bool h2_routes_with(const char *path, void (*fn)(const char *json, void *arg), void *arg);
+/* 新增或覆盖时 JSON 会被压缩（去掉字符串外的空白），md5 为压缩后 JSON 的小写 hex */
+/* 持锁调用 fn(json, md5)，找不到返回 false；fn 内不要阻塞太久 */
+bool h2_routes_with(const char *path, void (*fn)(const char *json, const char *md5, void *arg), void *arg);
 /* 持锁遍历全部条目 */
 void h2_routes_foreach(void (*fn)(const char *path, const char *json, void *arg), void *arg);
