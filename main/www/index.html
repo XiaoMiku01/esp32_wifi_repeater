@@ -48,6 +48,18 @@
          border-radius:6px; font:12px/1.45 ui-monospace,Menlo,Consolas,monospace;
          white-space:pre-wrap; word-break:break-all; height:0; min-height:460px; }
   #log .E { color:#f87171; } #log .W { color:#fbbf24; } #log .I { color:#86efac; }
+  /* 命中自定义接口的日志行 */
+  #log .hit { background:rgba(250,204,21,.18); color:#fde047; box-shadow:inset 3px 0 0 #facc15;
+              padding-left:6px; font-weight:600; }
+  #toasts { position:fixed; top:12px; right:12px; z-index:1000; display:flex; flex-direction:column;
+            gap:8px; width:min(360px, calc(100vw - 24px)); }
+  .toast { background:#1f2937; color:#f9fafb; border-left:4px solid #facc15; border-radius:6px;
+           padding:8px 12px; box-shadow:0 6px 18px rgba(0,0,0,.35); cursor:pointer;
+           animation:toast-in .2s ease-out; }
+  .toast .t { font-weight:600; color:#fde047; }
+  .toast .s { color:#d1d5db; font-size:12px; word-break:break-all; margin-top:2px; }
+  @keyframes toast-in { from { opacity:0; transform:translateY(-6px); } to { opacity:1; transform:none; } }
+  @keyframes hit-flash { from { background:rgba(250,204,21,.5); } to { background:transparent; } }
   #log .D, #log .V { color:#9ca3af; }
   .muted { color:var(--muted); font-size:12px; }
   .ssid-row { display:flex; gap:6px; }
@@ -83,6 +95,10 @@
   #rtList .j { flex:1; min-width:0; color:var(--muted); font-size:12px; overflow:hidden;
                text-overflow:ellipsis; white-space:nowrap; font-family:ui-monospace,Menlo,Consolas,monospace; }
   #rtList button { padding:3px 8px; font-size:12px; }
+  #rtList li.flash { animation:hit-flash 2s ease-out; }
+  #rtList .cnt { font-size:11px; padding:0 6px; border-radius:8px; background:#facc15; color:#111;
+                 white-space:nowrap; }
+  #rtList .cnt:empty { display:none; }
   #rtMsg.ok, #dnsMsg.ok, #siteMsg.ok { color:var(--ok); }
   #rtMsg.bad, #dnsMsg.bad, #siteMsg.bad { color:var(--bad); }
   #siteMsg.warn { color:#d97706; }
@@ -421,8 +437,11 @@ function rtRender() {
   $('rtEmpty').style.display = rtInfo.routes.length ? 'none' : '';
   for (const r of rtInfo.routes) {
     const li = document.createElement('li');
+    li.dataset.path = r.path;
     const p = document.createElement('span'); p.className = 'p'; p.textContent = r.path;
     const j = document.createElement('span'); j.className = 'j'; j.textContent = r.json; j.title = r.json;
+    const cnt = document.createElement('span'); cnt.className = 'cnt';
+    cnt.textContent = hitCounts[r.path] ? `命中 ${hitCounts[r.path]}` : '';
     const ed = document.createElement('button'); ed.type = 'button'; ed.textContent = '编辑'; ed.onclick = () => rtEdit(r);
     const del = document.createElement('button'); del.type = 'button'; del.textContent = '删除';
     del.onclick = async () => {
@@ -430,7 +449,7 @@ function rtRender() {
       try { await rtPost({ action: 'del', path: r.path }); rtShowMsg(`已删除 ${r.path}`, true); await rtLoad(); }
       catch (e) { rtShowMsg(e.message, false); }
     };
-    li.append(p, j, ed, del);
+    li.append(p, j, cnt, ed, del);
     ul.appendChild(li);
   }
 }
@@ -912,6 +931,35 @@ const logEl = $('log');
 const MAX_LINES = 2000;
 let paused = false, pending = [], partial = '', decoder = new TextDecoder('utf-8');
 
+/* 设备在命中自定义接口时输出：h2_test: HIT path=<配置路径> method= proto= peer= req=<请求路径> */
+const HIT_RE = /\bh2_test: HIT path=(\S+) method=(\S+) proto=(\S+) peer=(\S+) req=(.*)$/;
+const hitCounts = {};
+let liveAfter = 0;   /* 连接后先收到的是历史日志：只高亮，不弹提示 */
+
+function showToast(title, sub) {
+  let box = $('toasts');
+  if (!box) { box = document.createElement('div'); box.id = 'toasts'; document.body.appendChild(box); }
+  const t = document.createElement('div'); t.className = 'toast'; t.title = '点击关闭';
+  const a = document.createElement('div'); a.className = 't'; a.textContent = title;
+  const b = document.createElement('div'); b.className = 's'; b.textContent = sub;
+  t.append(a, b);
+  t.onclick = () => t.remove();
+  box.prepend(t);
+  while (box.childElementCount > 5) box.lastElementChild.remove();
+  setTimeout(() => t.remove(), 6000);
+}
+function onHit(m) {
+  const [, path, method, proto, peer, req] = m;
+  hitCounts[path] = (hitCounts[path] || 0) + 1;
+  showToast(`命中自定义接口 ${path}`, `${method} ${req} · ${proto === 'h2' ? 'HTTP/2' : 'HTTP/1.1'} · ${peer}`);
+  for (const li of $('rtList').children) {
+    if (li.dataset.path !== path) continue;
+    const c = li.querySelector('.cnt');
+    if (c) c.textContent = `命中 ${hitCounts[path]}`;
+    li.classList.remove('flash'); void li.offsetWidth; li.classList.add('flash');
+  }
+}
+
 function levelOf(line) {
   const m = /^(?:\x1b\[[0-9;]*m)?([EWIDV]) \(/.exec(line);
   return m ? m[1] : '';
@@ -923,6 +971,7 @@ function appendLines(lines) {
     const div = document.createElement('div');
     const lv = levelOf(line);
     if (lv) div.className = lv;
+    if (HIT_RE.test(line)) div.classList.add('hit');
     div.textContent = line;
     frag.appendChild(div);
   }
@@ -935,6 +984,13 @@ function onText(text) {
   const parts = partial.split(/\r?\n/);
   partial = parts.pop();
   if (!parts.length) return;
+  /* 暂停滚动时也照常提示 */
+  if (Date.now() >= liveAfter) {
+    for (const l of parts) {
+      const m = HIT_RE.exec(l.replace(/\x1b\[[0-9;]*m/g, ''));
+      if (m) onHit(m);
+    }
+  }
   if (paused) { pending.push(...parts); if (pending.length > MAX_LINES) pending.splice(0, pending.length - MAX_LINES); }
   else appendLines(parts);
 }
@@ -942,7 +998,10 @@ function onText(text) {
 function connectWs() {
   const ws = new WebSocket(`ws://${location.host}/ws`);
   ws.binaryType = 'arraybuffer';
-  ws.onopen = () => { $('wsDot').className = 'dot ok'; logEl.textContent = ''; partial = ''; decoder = new TextDecoder('utf-8'); };
+  ws.onopen = () => {
+    $('wsDot').className = 'dot ok'; logEl.textContent = ''; partial = ''; decoder = new TextDecoder('utf-8');
+    liveAfter = Date.now() + 1500;
+  };
   ws.onmessage = ev => onText(typeof ev.data === 'string' ? ev.data : decoder.decode(ev.data, { stream: true }));
   ws.onclose = () => { $('wsDot').className = 'dot bad'; setTimeout(connectWs, 2000); };
   ws.onerror = () => ws.close();

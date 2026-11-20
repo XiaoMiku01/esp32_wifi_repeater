@@ -257,7 +257,8 @@ static bool contains_segments(const char *req, size_t rlen, const char *pat, siz
 }
 
 /* 任意位置整段匹配；多条命中时取最长（最具体）的一条，因此完全相同的路径优先 */
-bool h2_routes_with(const char *path, void (*fn)(const char *json, const char *md5, void *arg), void *arg)
+bool h2_routes_with(const char *path,
+                    void (*fn)(const char *matched, const char *json, const char *md5, void *arg), void *arg)
 {
     size_t rlen = strlen(path);
     int best = -1;
@@ -274,7 +275,7 @@ bool h2_routes_with(const char *path, void (*fn)(const char *json, const char *m
         }
     }
     if (best >= 0) {
-        fn(s_tab[best].json, s_tab[best].md5, arg);
+        fn(s_tab[best].path, s_tab[best].json, s_tab[best].md5, arg);
     }
     xSemaphoreGive(s_lock);
     return best >= 0;

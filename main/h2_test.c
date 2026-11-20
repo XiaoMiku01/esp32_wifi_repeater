@@ -102,9 +102,12 @@ static esp_err_t echo_post(h2_req_t *req)
  *   x-checksum: <md5(body) 小写 hex>
  *   cache-control: no-store
  *   正文为压缩 JSON（无空格、无换行） */
-static void send_custom_json(const char *json, const char *md5, void *arg)
+static void send_custom_json(const char *matched, const char *json, const char *md5, void *arg)
 {
     h2_req_t *req = arg;
+    /* 固定格式，配置页据此高亮并提示；配置路径不含空白，请求路径（可能含解码出的空格）放最后 */
+    ESP_LOGI(TAG, "HIT path=%s method=%s proto=%s peer=%s req=%s", matched, h2_req_method(req),
+             h2_req_proto(req), h2_req_peer(req), h2_req_path(req));
     h2_resp_add_header(req, "x-checksum", md5);
     h2_resp_add_header(req, "cache-control", "no-store");
     h2_resp_sendstr(req, 200, "application/json", json);
