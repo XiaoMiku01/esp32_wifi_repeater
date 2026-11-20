@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32 Wi-Fi 中继 · 记录</title>
+<style>
+  :root { --bg:#f4f5f7; --card:#fff; --fg:#1d1f23; --muted:#6b7280; --line:#e5e7eb;
+          --accent:#2563eb; --ok:#16a34a; --bad:#dc2626; --warn:#d97706; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#111317; --card:#1a1d23; --fg:#e5e7eb; --muted:#9ca3af; --line:#2a2e36; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+         background:var(--bg); color:var(--fg); }
+  header { padding:12px 20px; border-bottom:1px solid var(--line); background:var(--card);
+           display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+  header h1 { font-size:16px; margin:0; }
+  header a { color:var(--accent); text-decoration:none; }
+  .spacer { flex:1; }
+  main { max-width:1400px; margin:0 auto; padding:16px; display:grid; gap:16px; }
+  .top { display:grid; gap:16px; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px 16px; min-width:0; }
+  .card h2 { font-size:14px; margin:0 0 10px; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .muted { color:var(--muted); font-size:12px; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  button { padding:5px 12px; border:1px solid var(--line); border-radius:4px; background:var(--card);
+           color:var(--fg); font:inherit; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.danger { color:var(--bad); border-color:var(--bad); }
+  button.small { padding:1px 8px; font-size:12px; }
+  input[type=text], select { padding:5px 8px; border:1px solid var(--line); border-radius:4px;
+                             background:var(--bg); color:var(--fg); font:inherit; }
+  .stats { display:grid; grid-template-columns:repeat(auto-fit, minmax(120px, 1fr)); gap:8px; }
+  .stat { border:1px solid var(--line); border-radius:6px; padding:6px 10px; }
+  .stat .v { font-size:18px; font-weight:600; }
+  .stat .k { color:var(--muted); font-size:12px; }
+  .tbl { overflow:auto; max-height:460px; border:1px solid var(--line); border-radius:6px; }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th, td { padding:5px 8px; border-bottom:1px solid var(--line); text-align:left; white-space:nowrap; }
+  th { position:sticky; top:0; background:var(--card); font-weight:600; color:var(--muted); z-index:1; }
+  td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; }
+  td.dom { max-width:280px; overflow:hidden; text-overflow:ellipsis; }
+  tr.sel { background:rgba(37,99,235,.12); }
+  tr.click { cursor:pointer; }
+  tr.click:hover { background:rgba(127,127,127,.08); }
+  tr.closed td { color:var(--muted); }
+  tr.blocked td { color:var(--bad); }
+  .badge { display:inline-block; padding:0 6px; border-radius:8px; font-size:11px; border:1px solid var(--line); }
+  .badge.ok { color:var(--ok); border-color:var(--ok); }
+  .badge.bad { color:var(--bad); border-color:var(--bad); }
+  .badge.warn { color:var(--warn); border-color:var(--warn); }
+  .src { color:var(--muted); font-size:11px; margin-left:4px; }
+  .msg.ok { color:var(--ok); } .msg.bad { color:var(--bad); }
+  #blkList { list-style:none; margin:8px 0 0; padding:0; max-height:220px; overflow:auto; }
+  #blkList li { display:flex; align-items:center; gap:8px; padding:4px 0; border-bottom:1px solid var(--line); }
+  #blkList li .d { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; font-family:ui-monospace,Menlo,monospace; }
+  .up { color:#2563eb; } .down { color:#16a34a; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ESP32 Wi-Fi 中继 · 记录</h1>
+  <a href="/">← 配置页</a>
+  <span class="spacer"></span>
+  <span class="muted" id="uptime">-</span>
+  <label class="row muted" style="gap:4px"><input type="checkbox" id="enabled" checked>记录与拦截</label>
+</header>
+
+<main>
+  <div class="top">
+    <section class="card">
+      <h2>性能</h2>
+      <div class="stats">
+        <div class="stat"><div class="v" id="pPps">-</div><div class="k">转发包/秒</div></div>
+        <div class="stat"><div class="v" id="pAvg">-</div><div class="k">钩子平均耗时</div></div>
+        <div class="stat"><div class="v" id="pMax">-</div><div class="k">钩子最大耗时</div></div>
+        <div class="stat"><div class="v" id="pTotal">-</div><div class="k">合计（↑+↓）</div></div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button id="benchBtn">运行压测</button>
+        <button id="resetPerf">重置统计</button>
+      </div>
+      <div class="muted" id="benchOut" style="margin-top:6px"></div>
+    </section>
+
+    <section class="card">
+      <h2>黑名单 <span class="muted" id="blkCount"></span></h2>
+      <div class="row">
+        <input type="text" id="blkInput" placeholder="example.com（含子域名）" style="flex:1; min-width:160px">
+        <button class="primary" id="blkAdd">拉黑</button>
+      </div>
+      <div class="msg" id="blkMsg"></div>
+      <ul id="blkList"></ul>
+      <p class="muted">拉黑后：该域名及子域名不再解析（NXDOMAIN）；已知 IP 与识别到该域名的连接被丢包，
+        已建立的 TCP 连接会被断开。共用 IP 的其他网站可能受影响。</p>
+    </section>
+  </div>
+
+  <section class="card">
+    <h2>设备 <span class="muted">（本次开机，点击一行可筛选下方连接和 DNS 记录）</span></h2>
+    <div class="tbl">
+      <table>
+        <thead><tr><th>状态</th><th>IP</th><th>主机名</th><th>MAC</th><th>首次出现</th>
+          <th class="num">↑ 速率</th><th class="num">↓ 速率</th><th class="num">累计 ↑</th><th class="num">累计 ↓</th>
+          <th class="num">DNS</th></tr></thead>
+        <tbody id="clients"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>连接 <span class="muted" id="flowCount"></span>
+      <span class="spacer"></span>
+      <span class="badge" id="filterTag" style="display:none"></span>
+      <input type="text" id="flowSearch" placeholder="搜索域名 / IP / 类型">
+      <label class="row muted" style="gap:4px"><input type="checkbox" id="hideClosed" checked>隐藏已关闭</label>
+    </h2>
+    <div class="tbl">
+      <table>
+        <thead><tr><th>设备</th><th>类型</th><th>域名</th><th>远端</th>
+          <th class="num">↑ 速率</th><th class="num">↓ 速率</th><th class="num">累计 ↑</th><th class="num">累计 ↓</th>
+          <th class="num">时长</th><th>状态</th><th></th></tr></thead>
+        <tbody id="flows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>DNS 记录 <span class="muted" id="dnsCount"></span>
+      <span class="spacer"></span>
+      <input type="text" id="dnsSearch" placeholder="搜索域名">
+      <button class="small" id="dnsClear">清空显示</button>
+    </h2>
+    <div class="tbl">
+      <table>
+        <thead><tr><th>时间</th><th>设备</th><th>域名</th><th>类型</th><th>结果</th><th>应答</th><th></th></tr></thead>
+        <tbody id="dns"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const el = (tag, text, cls) => { const e = document.createElement(tag); if (text !== undefined) e.textContent = text; if (cls) e.className = cls; return e; };
+
+let uptime = 0, selIp = '', blocked = new Set();
+let dnsLast = 0, dnsRows = [];
+const DNS_KEEP = 500;
+const QT = { 1: 'A', 2: 'NS', 5: 'CNAME', 6: 'SOA', 12: 'PTR', 15: 'MX', 16: 'TXT', 28: 'AAAA', 33: 'SRV', 64: 'SVCB', 65: 'HTTPS', 255: 'ANY' };
+const RES = { forward: ['转发', ''], local: ['本地应答', 'ok'], blocked: ['已拦截', 'bad'] };
+const SRC = { dns: 'DNS', sni: 'SNI', host: 'Host' };
+
+function fmtBytes(n) {
+  if (n < 1024) return n + ' B';
+  const u = ['KB', 'MB', 'GB', 'TB']; let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+  return n.toFixed(n < 10 ? 2 : n < 100 ? 1 : 0) + ' ' + u[i];
+}
+const fmtRate = n => n ? fmtBytes(n) + '/s' : '-';
+function fmtDur(s) {
+  s = Math.max(0, s | 0);
+  const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), sec = s % 60;
+  return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(sec).padStart(2, '0');
+}
+const fmtAgo = t => { const d = uptime - t; return d < 2 ? '刚刚' : d < 60 ? d + ' 秒前' : d < 3600 ? Math.floor(d / 60) + ' 分钟前' : Math.floor(d / 3600) + ' 小时前'; };
+const fmtAt = t => '开机后 ' + fmtDur(t);
+
+function isBlocked(name) {
+  if (!name) return false;
+  for (const b of blocked) if (name === b || name.endsWith('.' + b)) return true;
+  return false;
+}
+
+async function post(url, fields) {
+  const r = await fetch(url, { method: 'POST', body: new URLSearchParams(fields) });
+  let j = {};
+  try { j = await r.json(); } catch (e) {}
+  if (!r.ok || !j.ok) throw new Error(j.error || `请求失败（${r.status}）`);
+}
+function blkMsg(t, ok) { const m = $('blkMsg'); m.textContent = t; m.className = 'msg ' + (ok ? 'ok' : 'bad'); }
+async function blockDomain(name) {
+  if (!confirm(`拉黑 ${name} 及其子域名？\n之后不再解析，相关连接会被断开。`)) return;
+  try { await post('/api/mon/block', { action: 'add', domain: name }); blkMsg(`已拉黑 ${name}`, true); await loadBlock(); }
+  catch (e) { blkMsg(e.message, false); }
+}
+function blockBtn(name) {
+  if (!name) return el('span');
+  if (isBlocked(name)) return el('span', '已拉黑', 'badge bad');
+  const b = el('button', '拉黑', 'small danger');
+  b.onclick = ev => { ev.stopPropagation(); blockDomain(name); };
+  return b;
+}
+
+/* ---------- 实时：设备、连接、性能 ---------- */
+function renderClients(list) {
+  const tb = $('clients'); tb.textContent = '';
+  list.sort((a, b) => (b.online - a.online) || ((b.rup + b.rdown) - (a.rup + a.rdown)) || (a.first - b.first));
+  for (const c of list) {
+    const tr = el('tr'); tr.className = 'click' + (c.ip && c.ip === selIp ? ' sel' : '');
+    tr.onclick = () => { selIp = selIp === c.ip ? '' : c.ip; refreshFilterTag(); poll(); renderDns(); };
+    const st = el('td'); st.appendChild(el('span', c.online ? '在线' : '离线', 'badge ' + (c.online ? 'ok' : '')));
+    tr.append(st, el('td', c.ip || '-'), el('td', c.host || '-'), el('td', c.mac || '-'), el('td', fmtAt(c.first)),
+      el('td', fmtRate(c.rup), 'num up'), el('td', fmtRate(c.rdown), 'num down'),
+      el('td', fmtBytes(c.up), 'num'), el('td', fmtBytes(c.down), 'num'), el('td', c.dns, 'num'));
+    tb.appendChild(tr);
+  }
+  if (!list.length) { const tr = el('tr'); const td = el('td', '还没有设备连接本机热点', 'muted'); td.colSpan = 10; tr.appendChild(td); tb.appendChild(tr); }
+}
+function refreshFilterTag() {
+  const t = $('filterTag');
+  t.style.display = selIp ? '' : 'none';
+  t.textContent = selIp ? `设备 ${selIp} ✕` : '';
+}
+$('filterTag').onclick = () => { selIp = ''; refreshFilterTag(); poll(); renderDns(); };
+
+let lastFlows = [];
+function renderFlows(list) {
+  lastFlows = list;
+  const q = $('flowSearch').value.trim().toLowerCase(), hide = $('hideClosed').checked;
+  const rows = list.filter(f => (!selIp || f.cip === selIp) && (!hide || f.state !== 'closed') &&
+    (!q || (f.domain + ' ' + f.rip + ' ' + f.type + ' ' + f.cip).toLowerCase().includes(q)));
+  rows.sort((a, b) => ((b.rup + b.rdown) - (a.rup + a.rdown)) || (b.last - a.last));
+  $('flowCount').textContent = `（显示 ${Math.min(rows.length, 300)} / 共 ${list.length}）`;
+  const tb = $('flows'); tb.textContent = '';
+  for (const f of rows.slice(0, 300)) {
+    const tr = el('tr', undefined, f.state === 'blocked' ? 'blocked' : f.state === 'closed' ? 'closed' : '');
+    const dom = el('td', undefined, 'dom');
+    dom.textContent = f.domain || '-';
+    dom.title = f.domain;
+    if (f.domain && f.src) dom.appendChild(el('span', SRC[f.src] || f.src, 'src'));
+    const st = el('td');
+    st.appendChild(el('span', f.state === 'blocked' ? '已拦截' : f.state === 'closed' ? '已关闭' : '活动',
+      'badge ' + (f.state === 'blocked' ? 'bad' : f.state === 'open' ? 'ok' : '')));
+    const act = el('td'); act.appendChild(blockBtn(f.domain));
+    tr.append(el('td', f.cip), el('td', f.type), dom, el('td', `${f.rip}:${f.rport}`),
+      el('td', fmtRate(f.rup), 'num up'), el('td', fmtRate(f.rdown), 'num down'),
+      el('td', fmtBytes(f.up), 'num'), el('td', fmtBytes(f.down), 'num'),
+      el('td', fmtDur(f.last - f.first), 'num'), st, act);
+    tb.appendChild(tr);
+  }
+  if (!rows.length) { const tr = el('tr'); const td = el('td', '没有匹配的连接', 'muted'); td.colSpan = 11; tr.appendChild(td); tb.appendChild(tr); }
+}
+$('flowSearch').oninput = () => renderFlows(lastFlows);
+$('hideClosed').onchange = () => renderFlows(lastFlows);
+
+function renderPerf(p, clients) {
+  const us = c => p.cpu_mhz ? (c / p.cpu_mhz).toFixed(c / p.cpu_mhz < 10 ? 2 : 1) + ' µs' : c + ' 周期';
+  $('pPps').textContent = p.pps;
+  $('pAvg').textContent = p.pkts ? us(p.avg_cycles) : '-';
+  $('pMax').textContent = p.pkts ? us(p.max_cycles) : '-';
+  let up = 0, down = 0;
+  for (const c of clients) { up += c.rup; down += c.rdown; }
+  $('pTotal').textContent = fmtRate(up + down);
+}
+
+let polling = false;
+async function poll() {
+  if (polling) return;
+  polling = true;
+  try {
+    const d = await (await fetch('/api/mon/live', { cache: 'no-store' })).json();
+    uptime = d.uptime;
+    $('uptime').textContent = '开机 ' + fmtDur(uptime);
+    $('enabled').checked = d.enabled;
+    renderPerf(d.perf, d.clients);
+    renderClients(d.clients);
+    renderFlows(d.flows);
+  } catch (e) {
+    $('uptime').textContent = '设备无响应';
+  } finally { polling = false; }
+}
+
+/* ---------- DNS 记录 ---------- */
+function renderDns() {
+  const q = $('dnsSearch').value.trim().toLowerCase();
+  const rows = dnsRows.filter(r => (!selIp || r.cip === selIp) && (!q || r.name.includes(q)));
+  $('dnsCount').textContent = `（显示 ${Math.min(rows.length, 300)} / 已收到 ${dnsRows.length}）`;
+  const tb = $('dns'); tb.textContent = '';
+  for (const r of rows.slice(0, 300)) {
+    const [rt, rc] = RES[r.res] || [r.res, ''];
+    const res = el('td'); res.appendChild(el('span', rt, 'badge ' + rc));
+    const name = el('td', r.name, 'dom'); name.title = r.name;
+    const act = el('td'); act.appendChild(r.res === 'blocked' ? el('span') : blockBtn(r.name));
+    const tr = el('tr', undefined, r.res === 'blocked' ? 'blocked' : '');
+    const t = el('td', fmtAgo(r.t)); t.title = fmtAt(r.t);
+    tr.append(t, el('td', r.cip), name, el('td', QT[r.qtype] || r.qtype), res, el('td', r.ans.join(', ') || '-'), act);
+    tb.appendChild(tr);
+  }
+  if (!rows.length) { const tr = el('tr'); const td = el('td', '暂无记录', 'muted'); td.colSpan = 7; tr.appendChild(td); tb.appendChild(tr); }
+}
+async function pollDns() {
+  try {
+    const d = await (await fetch('/api/mon/dns?since=' + dnsLast, { cache: 'no-store' })).json();
+    if (d.last < dnsLast) { dnsRows = []; }           /* 设备重启 */
+    dnsLast = d.last;
+    if (d.entries.length) {
+      dnsRows = d.entries.reverse().concat(dnsRows).slice(0, DNS_KEEP);
+    }
+    renderDns();
+  } catch (e) {}
+}
+$('dnsSearch').oninput = renderDns;
+$('dnsClear').onclick = () => { dnsRows = []; renderDns(); };
+
+/* ---------- 黑名单 ---------- */
+async function loadBlock() {
+  try {
+    const d = await (await fetch('/api/mon/block', { cache: 'no-store' })).json();
+    blocked = new Set(d.list.map(b => b.domain));
+    $('blkCount').textContent = `（${d.list.length}/${d.max}，已知 IP ${d.ips} 个）`;
+    const ul = $('blkList'); ul.textContent = '';
+    for (const b of d.list) {
+      const li = el('li');
+      const del = el('button', '解除', 'small');
+      del.onclick = async () => {
+        try { await post('/api/mon/block', { action: 'del', domain: b.domain }); blkMsg(`已解除 ${b.domain}`, true); await loadBlock(); }
+        catch (e) { blkMsg(e.message, false); }
+      };
+      li.append(el('span', b.domain, 'd'), el('span', `拦截 ${b.hits} 次`, 'muted'), del);
+      ul.appendChild(li);
+    }
+    if (!d.list.length) ul.appendChild(el('li', '黑名单为空', 'muted'));
+  } catch (e) {}
+}
+$('blkAdd').onclick = async () => {
+  const d = $('blkInput').value.trim().toLowerCase().replace(/\.$/, '');
+  if (!d) return;
+  try { await post('/api/mon/block', { action: 'add', domain: d }); $('blkInput').value = ''; blkMsg(`已拉黑 ${d}`, true); await loadBlock(); }
+  catch (e) { blkMsg(e.message, false); }
+};
+$('blkInput').onkeydown = e => { if (e.key === 'Enter') $('blkAdd').click(); };
+
+/* ---------- 控制 ---------- */
+$('enabled').onchange = async () => {
+  try { await post('/api/mon/ctl', { action: $('enabled').checked ? 'enable' : 'disable' }); }
+  catch (e) { alert(e.message); }
+};
+$('resetPerf').onclick = () => post('/api/mon/ctl', { action: 'reset_perf' }).catch(e => alert(e.message));
+$('benchBtn').onclick = async () => {
+  $('benchBtn').disabled = true; $('benchOut').textContent = '压测中…';
+  try {
+    const b = await (await fetch('/api/mon/bench', { cache: 'no-store' })).json();
+    $('benchOut').textContent = `合成 ${b.packets} 个包 / ${b.flows} 条连接：平均 ${b.avg_us} µs/包（${b.avg_cycles} 周期），` +
+      `最大 ${(b.max_cycles / b.cpu_mhz).toFixed(1)} µs；仅钩子可承受约 ${Math.round(b.max_pps_hook_only).toLocaleString()} 包/秒`;
+  } catch (e) { $('benchOut').textContent = '压测失败：' + e.message; }
+  $('benchBtn').disabled = false;
+};
+
+refreshFilterTag();
+loadBlock().then(() => { poll(); pollDns(); });
+setInterval(poll, 1000);
+setInterval(pollDns, 2000);
+setInterval(loadBlock, 3000);
+</script>
+</body>
+</html>

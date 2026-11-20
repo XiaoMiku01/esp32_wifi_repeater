@@ -22,6 +22,7 @@
 #include "repeater.h"
 #include "h2_routes.h"
 #include "h2_site.h"
+#include "monitor.h"
 
 #define RECONNECT_DELAY_MS  3000
 #define APPLY_DELAY_MS      500   /* 先让 HTTP 响应发出去再动 Wi-Fi */
@@ -84,11 +85,13 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
         case WIFI_EVENT_AP_STACONNECTED: {
             wifi_event_ap_staconnected_t *e = data;
             ESP_LOGI(TAG, "客户端 " MACSTR " 加入, AID=%d", MAC2STR(e->mac), e->aid);
+            monitor_on_join(e->mac);
             break;
         }
         case WIFI_EVENT_AP_STADISCONNECTED: {
             wifi_event_ap_stadisconnected_t *e = data;
             ESP_LOGI(TAG, "客户端 " MACSTR " 离开, reason=%d", MAC2STR(e->mac), e->reason);
+            monitor_on_leave(e->mac);
             break;
         }
         default:
@@ -103,6 +106,7 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
         } else if (id == IP_EVENT_ASSIGNED_IP_TO_CLIENT) {
             ip_event_assigned_ip_to_client_t *e = data;
             ESP_LOGI(TAG, "分配 " IPSTR " 给 " MACSTR, IP2STR(&e->ip), MAC2STR(e->mac));
+            monitor_on_ip(e->mac, e->ip.addr, e->hostname);
         }
     }
 }
@@ -290,6 +294,7 @@ void app_main(void)
 
     s_netif_ap = esp_netif_create_default_wifi_ap();
     s_netif_sta = esp_netif_create_default_wifi_sta();
+    monitor_init(s_netif_ap);     /* 须在 Wi-Fi 启动、DNS 中继之前 */
 
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, event_handler, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, event_handler, NULL, NULL));

@@ -20,6 +20,7 @@
 #include "esp_netif.h"
 #include "lwip/sockets.h"
 #include "repeater.h"
+#include "monitor.h"
 
 #define DNS_PORT      53
 #define BUF_SIZE      1500
@@ -34,6 +35,8 @@ typedef struct {
     uint16_t new_id;
     struct sockaddr_in client;
     TickType_t ts;
+    uint32_t log_id;                    /* 流量记录中的 DNS 记录 id，0 表示未记录 */
+    char qname[64];
 } slot_t;
 
 #define LOCAL_TTL     60
@@ -132,6 +135,50 @@ static bool lookup_override(const char *name, uint32_t *ip)
     }
     xSemaphoreGive(s_ovr_lock);
     return hit;
+}
+
+static int skip_name(const uint8_t *p, int n, int off)
+{
+    while (off < n) {
+        uint8_t l = p[off];
+        if (l == 0) {
+            return off + 1;
+        }
+        if ((l & 0xC0) == 0xC0) {
+            return off + 2 <= n ? off + 2 : -1;
+        }
+        off += 1 + l;
+    }
+    return -1;
+}
+
+/* 从上游应答中取 A 记录（RCODE 须为 0），返回个数 */
+static int parse_a_records(const uint8_t *p, int n, uint32_t *ips, int max)
+{
+    if (n < 12 || (p[3] & 0x0F) != 0) {
+        return 0;
+    }
+    int qd = (p[4] << 8) | p[5], an = (p[6] << 8) | p[7];
+    int off = 12;
+    for (int i = 0; i < qd; i++) {
+        off = skip_name(p, n, off);
+        if (off < 0 || off + 4 > n) return 0;
+        off += 4;
+    }
+    int k = 0;
+    for (int i = 0; i < an && k < max; i++) {
+        off = skip_name(p, n, off);
+        if (off < 0 || off + 10 > n) break;
+        uint16_t type = (p[off] << 8) | p[off + 1];
+        uint16_t rdlen = (p[off + 8] << 8) | p[off + 9];
+        off += 10;
+        if (off + rdlen > n) break;
+        if (type == 1 && rdlen == 4) {
+            memcpy(&ips[k++], p + off, 4);
+        }
+        off += rdlen;
+    }
+    return k;
 }
 
 /* 在查询报文原地构造应答，返回应答长度 */
@@ -356,10 +403,21 @@ static void dns_relay_task(void *arg)
             socklen_t flen = sizeof(from);
             int n = recvfrom(lsock, buf, sizeof(buf), 0, (struct sockaddr *)&from, &flen);
 
-            /* 本地覆盖的域名直接应答，不依赖上游 */
             char qname[256];
-            uint16_t qtype;
-            int qend = s_n_ovr ? parse_question(buf, n, qname, sizeof(qname), &qtype) : -1;
+            uint16_t qtype = 0;
+            int qend = parse_question(buf, n, qname, sizeof(qname), &qtype);
+            uint32_t cip = from.sin_addr.s_addr;
+
+            /* 黑名单：回 NXDOMAIN */
+            if (qend > 0 && qend + 16 <= (int)sizeof(buf) && monitor_is_blocked(qname)) {
+                int len = build_local_answer(buf, qend, 0, 0);     /* 无应答记录 */
+                buf[3] = 0x83;                                      /* RA=1，RCODE=3 */
+                sendto(lsock, buf, len, 0, (struct sockaddr *)&from, flen);
+                monitor_dns_query(cip, qname, qtype, MON_DNS_BLOCKED, 0);
+                continue;
+            }
+
+            /* 本地覆盖的域名直接应答，不依赖上游 */
             uint32_t ip;
             if (qend > 0 && qend + 16 <= (int)sizeof(buf) && lookup_override(qname, &ip)) {
                 if (ip == 0) {
@@ -367,7 +425,7 @@ static void dns_relay_task(void *arg)
                 }
                 int len = build_local_answer(buf, qend, qtype, ip);
                 sendto(lsock, buf, len, 0, (struct sockaddr *)&from, flen);
-                ESP_LOGD(TAG, "本地应答 %s type=%u", qname, qtype);
+                monitor_dns_query(cip, qname, qtype, MON_DNS_LOCAL, ip);
                 continue;
             }
 
@@ -379,6 +437,12 @@ static void dns_relay_task(void *arg)
                 s->new_id = next_id++;
                 s->client = from;
                 s->ts = now;
+                s->log_id = 0;
+                s->qname[0] = '\0';
+                if (qend > 0) {
+                    s->log_id = monitor_dns_query(cip, qname, qtype, MON_DNS_FORWARD, 0);
+                    strlcpy(s->qname, qname, sizeof(s->qname));
+                }
                 buf[0] = s->new_id >> 8;
                 buf[1] = s->new_id & 0xff;
                 sendto(usock, buf, n, 0, (struct sockaddr *)&up, sizeof(up));
@@ -398,6 +462,13 @@ static void dns_relay_task(void *arg)
             for (int i = 0; i < SLOTS; i++) {
                 slot_t *s = &s_slots[i];
                 if (s->used && s->new_id == id) {
+                    if (s->log_id) {
+                        uint32_t ips[8];
+                        int k = parse_a_records(buf, n, ips, 8);
+                        if (k > 0) {
+                            monitor_dns_answer(s->log_id, s->qname, ips, k);
+                        }
+                    }
                     buf[0] = s->orig_id >> 8;
                     buf[1] = s->orig_id & 0xff;
                     sendto(lsock, buf, n, 0, (struct sockaddr *)&s->client, sizeof(s->client));

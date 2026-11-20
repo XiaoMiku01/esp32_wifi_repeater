@@ -14,6 +14,12 @@
  *   GET  /api/h2site   HTTP/2 站点域名与证书信息（不含私钥）
  *   POST /api/h2site   修改（action=set&domain=&cert=&key=，cert/key 同时为空表示只改域名）
  *                      或恢复内嵌（action=reset）
+ *   GET  /monitor        记录页（main/www/monitor.html）
+ *   GET  /api/mon/live   客户端、连接、性能统计
+ *   GET  /api/mon/dns    DNS 记录（?since=<id> 增量）
+ *   GET  /api/mon/block  黑名单；POST action=add|del&domain=
+ *   POST /api/mon/ctl    action=enable|disable|reset_perf
+ *   GET  /api/mon/bench  合成包压测转发钩子开销
  *   GET  /api/export   导出全部配置 JSON（含 Wi-Fi 密码与网页上传的私钥），网页端转为 YAML；
  *                      导入由网页解析 YAML 后逐段调用上述接口完成
  *   GET  /ws           WebSocket，推送实时日志（二进制帧，UTF-8 文本）
@@ -31,6 +37,7 @@
 #include "web_log_priv.h"
 #include "h2_routes.h"
 #include "h2_site.h"
+#include "monitor.h"
 #include "lwip/inet.h"
 
 static const char *TAG = "web";
@@ -38,6 +45,8 @@ static httpd_handle_t s_server;
 
 extern const char index_html_start[] asm("_binary_index_html_start");
 extern const char index_html_end[]   asm("_binary_index_html_end");
+extern const char monitor_html_start[] asm("_binary_monitor_html_start");
+extern const char monitor_html_end[]   asm("_binary_monitor_html_end");
 
 /* ---------- 工具函数 ---------- */
 
@@ -640,6 +649,127 @@ static esp_err_t h2site_post(httpd_req_t *req)
     return ret;
 }
 
+/* ---------- 流量记录 ---------- */
+
+static esp_err_t monitor_page_get(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    return httpd_resp_send(req, monitor_html_start, monitor_html_end - monitor_html_start - 1);
+}
+
+static esp_err_t send_owned_json(httpd_req_t *req, char *buf, size_t len)
+{
+    if (!buf) {
+        return send_json_error(req, "500 Internal Server Error", "内存不足");
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    esp_err_t ret = httpd_resp_send(req, buf, len);
+    free(buf);
+    return ret;
+}
+
+static esp_err_t mon_live_get(httpd_req_t *req)
+{
+    size_t len = 0;
+    char *b = monitor_live_json(&len);
+    return send_owned_json(req, b, len);
+}
+
+static esp_err_t mon_dns_get(httpd_req_t *req)
+{
+    char q[48], v[16];
+    uint32_t since = 0;
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK &&
+        httpd_query_key_value(q, "since", v, sizeof(v)) == ESP_OK) {
+        since = strtoul(v, NULL, 10);
+    }
+    size_t len = 0;
+    char *b = monitor_dns_json(since, &len);
+    return send_owned_json(req, b, len);
+}
+
+static esp_err_t mon_block_get(httpd_req_t *req)
+{
+    size_t len = 0;
+    char *b = monitor_block_json(&len);
+    return send_owned_json(req, b, len);
+}
+
+static int recv_small_body(httpd_req_t *req, char *body, size_t cap)
+{
+    if (req->content_len == 0 || req->content_len >= cap) {
+        return -1;
+    }
+    size_t got = 0;
+    while (got < req->content_len) {
+        int r = httpd_req_recv(req, body + got, req->content_len - got);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+            continue;
+        }
+        if (r <= 0) {
+            return -1;
+        }
+        got += r;
+    }
+    body[got] = '\0';
+    return (int)got;
+}
+
+static esp_err_t mon_block_post(httpd_req_t *req)
+{
+    char body[256], action[8], domain[96];
+    if (recv_small_body(req, body, sizeof(body)) < 0) {
+        return send_json_error(req, "400 Bad Request", "请求无效");
+    }
+    if (form_get(body, "action", action, sizeof(action)) <= 0 ||
+        form_get(body, "domain", domain, sizeof(domain)) <= 0) {
+        return send_json_error(req, "400 Bad Request", "缺少 action 或 domain");
+    }
+    if (strcmp(action, "add") == 0) {
+        const char *msg = NULL;
+        if (monitor_block_add(domain, &msg) != ESP_OK) {
+            return send_json_error(req, "400 Bad Request", msg ? msg : "添加失败");
+        }
+    } else if (strcmp(action, "del") == 0) {
+        if (monitor_block_del(domain) != ESP_OK) {
+            return send_json_error(req, "404 Not Found", "黑名单中没有该域名");
+        }
+    } else {
+        return send_json_error(req, "400 Bad Request", "action 须为 add 或 del");
+    }
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
+static esp_err_t mon_ctl_post(httpd_req_t *req)
+{
+    char body[64], action[16];
+    if (recv_small_body(req, body, sizeof(body)) < 0 ||
+        form_get(body, "action", action, sizeof(action)) <= 0) {
+        return send_json_error(req, "400 Bad Request", "缺少 action");
+    }
+    if (strcmp(action, "enable") == 0) {
+        monitor_set_enabled(true);
+    } else if (strcmp(action, "disable") == 0) {
+        monitor_set_enabled(false);
+    } else if (strcmp(action, "reset_perf") == 0) {
+        monitor_reset_perf();
+    } else {
+        return send_json_error(req, "400 Bad Request", "action 须为 enable、disable 或 reset_perf");
+    }
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
+static esp_err_t mon_bench_get(httpd_req_t *req)
+{
+    size_t len = 0;
+    char *b = monitor_bench_json(&len);
+    return send_owned_json(req, b, len);
+}
+
 /* ---------- 配置导出（含密码与私钥，网页端转换为 YAML） ---------- */
 
 static void chunk_json_str(httpd_req_t *req, const char *s)
@@ -697,7 +827,16 @@ static esp_err_t export_get(httpd_req_t *req)
     ctx.not_first = false;
     httpd_resp_sendstr_chunk(req, ",\"h2_routes\":[");
     h2_routes_foreach(route_chunk, &ctx);
-    httpd_resp_sendstr_chunk(req, "]}");
+    httpd_resp_sendstr_chunk(req, "],\"blocklist\":");
+    size_t blen = 0;
+    char *bl = monitor_block_json(&blen);    /* {"max":..,"list":[{"domain","hits"}]}，网页端只取 domain */
+    if (bl) {
+        httpd_resp_send_chunk(req, bl, blen);
+        free(bl);
+    } else {
+        httpd_resp_sendstr_chunk(req, "null");
+    }
+    httpd_resp_sendstr_chunk(req, "}");
     ESP_LOGI(TAG, "配置已导出");
     return httpd_resp_sendstr_chunk(req, NULL);
 }
@@ -705,7 +844,7 @@ static esp_err_t export_get(httpd_req_t *req)
 esp_err_t web_server_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 18;
+    cfg.max_uri_handlers = 26;
     cfg.lru_purge_enable = true;
     cfg.stack_size = 6144;
 
@@ -730,6 +869,13 @@ esp_err_t web_server_start(void)
         { .uri = "/api/h2site",   .method = HTTP_GET,  .handler = h2site_get },
         { .uri = "/api/h2site",   .method = HTTP_POST, .handler = h2site_post },
         { .uri = "/api/export",   .method = HTTP_GET,  .handler = export_get },
+        { .uri = "/monitor",       .method = HTTP_GET,  .handler = monitor_page_get },
+        { .uri = "/api/mon/live",  .method = HTTP_GET,  .handler = mon_live_get },
+        { .uri = "/api/mon/dns",   .method = HTTP_GET,  .handler = mon_dns_get },
+        { .uri = "/api/mon/block", .method = HTTP_GET,  .handler = mon_block_get },
+        { .uri = "/api/mon/block", .method = HTTP_POST, .handler = mon_block_post },
+        { .uri = "/api/mon/ctl",   .method = HTTP_POST, .handler = mon_ctl_post },
+        { .uri = "/api/mon/bench", .method = HTTP_GET,  .handler = mon_bench_get },
         { .uri = "/ws",          .method = HTTP_GET,  .handler = ws_handler, .is_websocket = true,
           .ws_post_handshake_cb = ws_post_handshake },
     };
