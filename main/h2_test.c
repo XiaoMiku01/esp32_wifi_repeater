@@ -1,11 +1,13 @@
 /*
- * HTTP/2 测试接口（端口 8443，TLS，自签证书）
+ * HTTP/2 站点（端口 443，TLS，证书为 main/certs2/ 下 H2_SITE_DOMAIN 的证书链）
+ * 下游客户端经 DNS 中继把该域名解析到 192.168.4.1
+ *   GET  /          说明页
  *   GET  /ping      连通性 + 协议信息
  *   GET  /status    中继运行状态 JSON
  *   GET  /headers   回显请求头（验证 HPACK）
  *   POST /echo      原样回显请求体
  *
- * 测试：curl -k --http2 https://<ip>:8443/ping
+ * 测试（连在 ESP32 热点上）：curl --http2 https://www.aabbcc.com/ping
  */
 #include <stdio.h>
 #include "esp_log.h"
@@ -15,10 +17,21 @@
 
 static const char *TAG = "h2_test";
 
-extern const uint8_t h2_cert_start[] asm("_binary_h2_cert_pem_start");
-extern const uint8_t h2_cert_end[]   asm("_binary_h2_cert_pem_end");
-extern const uint8_t h2_key_start[]  asm("_binary_h2_key_pem_start");
-extern const uint8_t h2_key_end[]    asm("_binary_h2_key_pem_end");
+extern const uint8_t h2_cert_start[] asm("_binary_www_aabbcc_com_fullchain_pem_start");
+extern const uint8_t h2_cert_end[]   asm("_binary_www_aabbcc_com_fullchain_pem_end");
+extern const uint8_t h2_key_start[]  asm("_binary_www_aabbcc_com_key_start");
+extern const uint8_t h2_key_end[]    asm("_binary_www_aabbcc_com_key_end");
+
+static esp_err_t index_get(h2_req_t *req)
+{
+    static const char html[] =
+        "<!DOCTYPE html><html lang=\"zh-CN\"><meta charset=\"utf-8\">"
+        "<title>ESP32 HTTP/2</title>"
+        "<h1>ESP32 HTTP/2 OK</h1>"
+        "<ul><li><a href=\"/ping\">/ping</a></li><li><a href=\"/status\">/status</a></li>"
+        "<li><a href=\"/headers\">/headers</a></li><li>POST /echo</li></ul></html>\n";
+    return h2_resp_send(req, 200, "text/html; charset=utf-8", html, sizeof(html) - 1);
+}
 
 static esp_err_t ping_get(h2_req_t *req)
 {
@@ -86,7 +99,7 @@ static esp_err_t echo_post(h2_req_t *req)
 esp_err_t h2_test_start(void)
 {
     h2_server_config_t cfg = H2_SERVER_DEFAULT_CONFIG();
-    cfg.port = 8443;
+    cfg.port = H2_SITE_PORT;
     cfg.cert_pem = h2_cert_start;
     cfg.cert_len = h2_cert_end - h2_cert_start;
     cfg.key_pem = h2_key_start;
@@ -95,10 +108,12 @@ esp_err_t h2_test_start(void)
     h2_server_handle_t srv;
     esp_err_t err = h2_server_start(&cfg, &srv);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "HTTP/2 测试服务启动失败: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "HTTP/2 站点启动失败: %s", esp_err_to_name(err));
         return err;
     }
+    ESP_LOGI(TAG, "HTTP/2 站点 https://%s/ （端口 %d）", H2_SITE_DOMAIN, H2_SITE_PORT);
     const h2_route_t routes[] = {
+        { "GET",  "/",        index_get,   NULL },
         { "GET",  "/ping",    ping_get,    NULL },
         { "GET",  "/status",  status_get,  NULL },
         { "GET",  "/headers", headers_get, NULL },

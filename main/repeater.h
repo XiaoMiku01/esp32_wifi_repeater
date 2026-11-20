@@ -51,9 +51,14 @@ void web_log_init(void);
 
 /* DNS 中继（dns_relay.c） */
 void dns_relay_start(esp_netif_t *ap, esp_netif_t *sta);
+/* 登记本地解析的域名（须在 dns_relay_start 之前调用）；ip 为网络字节序，0 表示 AP 地址 */
+esp_err_t dns_relay_add_override(const char *name, uint32_t ip);
 
 /* Web 服务（web_server.c） */
 esp_err_t web_server_start(void);
 
-/* HTTP/2 测试接口（h2_test.c），端口 8443 */
+/* HTTP/2 站点（h2_test.c）：端口 443，证书为 main/certs2/ 下的该域名证书，
+ * DNS 中继把该域名解析到 AP 地址 */
+#define H2_SITE_DOMAIN  "www.aabbcc.com"
+#define H2_SITE_PORT    443
 esp_err_t h2_test_start(void);

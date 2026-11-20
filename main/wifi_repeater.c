@@ -307,6 +307,7 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_netif_napt_enable(s_netif_ap));
 
     /* 客户端 DNS 指向 192.168.4.1（DHCP 默认下发），由中继转发到上游 DNS */
+    dns_relay_add_override(H2_SITE_DOMAIN, 0);   /* 0 = 解析为 AP 地址 192.168.4.1 */
     dns_relay_start(s_netif_ap, s_netif_sta);
 
     ESP_ERROR_CHECK(web_server_start());
