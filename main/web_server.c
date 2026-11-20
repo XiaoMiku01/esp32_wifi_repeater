@@ -827,16 +827,7 @@ static esp_err_t export_get(httpd_req_t *req)
     ctx.not_first = false;
     httpd_resp_sendstr_chunk(req, ",\"h2_routes\":[");
     h2_routes_foreach(route_chunk, &ctx);
-    httpd_resp_sendstr_chunk(req, "],\"blocklist\":");
-    size_t blen = 0;
-    char *bl = monitor_block_json(&blen);    /* {"max":..,"list":[{"domain","hits"}]}，网页端只取 domain */
-    if (bl) {
-        httpd_resp_send_chunk(req, bl, blen);
-        free(bl);
-    } else {
-        httpd_resp_sendstr_chunk(req, "null");
-    }
-    httpd_resp_sendstr_chunk(req, "}");
+    httpd_resp_sendstr_chunk(req, "]}");
     ESP_LOGI(TAG, "配置已导出");
     return httpd_resp_sendstr_chunk(req, NULL);
 }

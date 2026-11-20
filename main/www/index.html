@@ -252,7 +252,7 @@
     <section class="card">
       <h2>配置备份（YAML）</h2>
       <p class="muted">导出文件包含 Wi-Fi 密码和网页上传的私钥（明文），请妥善保管。
-        导入时，文件中出现的段（wifi、dns、h2_site、h2_routes、blocklist）会整体替换设备上对应的配置，未出现的段保持不变；
+        导入时，文件中出现的段（wifi、dns、h2_site、h2_routes）会整体替换设备上对应的配置，未出现的段保持不变；
         wifi 段最后应用，改了热点时当前连接会断开。</p>
       <div class="row">
         <button type="button" class="primary" id="bkExport">导出 YAML</button>
@@ -637,10 +637,6 @@ function toYaml(c) {
     out.push('  cert: ' + yblock(c.h2_site.cert, 4));
     out.push('  key: ' + yblock(c.h2_site.key, 4));
   }
-  out.push('# 黑名单：域名及其子域名不再解析，相关连接被断开');
-  const bl = (c.blocklist && c.blocklist.list) ? c.blocklist.list.map(b => b.domain) : [];
-  if (!bl.length) out.push('blocklist: []');
-  else { out.push('blocklist:'); for (const d of bl) out.push('  - ' + yq(d)); }
   out.push('# HTTP/2 自定义接口：路径 -> 应答 JSON');
   if (!c.h2_routes.length) out.push('h2_routes: []');
   else {
@@ -824,16 +820,8 @@ function checkConfig(d) {
     if (!!cert !== !!key) throw new Error('h2_site 的 cert 和 key 须同时提供或同时省略');
     out.h2_site = { domain, cert, key };
   }
-  if (d.blocklist !== undefined) {
-    const list = d.blocklist === null ? [] : d.blocklist;
-    if (!Array.isArray(list)) throw new Error('blocklist 须为列表');
-    if (list.length > 32) throw new Error('blocklist 最多 32 条');
-    out.blocklist = list.map((v, k) => {
-      const n = str(v, `blocklist[${k + 1}]`).trim().toLowerCase().replace(/\.$/, '');
-      if (!/^([a-z0-9_-]+\.)+[a-z0-9_-]+$/.test(n) || n.length > 63) throw new Error(`blocklist 第 ${k + 1} 条域名格式错误：${n}`);
-      return n;
-    });
-  }
+  /* 旧版本导出的 blocklist 段：黑名单已不再保存，导入时忽略 */
+  if (d.blocklist !== undefined) out.ignoredBlocklist = true;
   if (d.h2_routes !== undefined) {
     const list = d.h2_routes === null ? [] : d.h2_routes;
     if (!Array.isArray(list)) throw new Error('h2_routes 须为列表');
@@ -893,7 +881,7 @@ $('bkFile').onchange = async () => {
   if (cfg.h2_site) parts.push(`HTTP/2 站点（${cfg.h2_site.domain}${cfg.h2_site.cert ? '，含证书' : '，内嵌证书'}）`);
   if (cfg.dns) parts.push(`DNS 自定义解析 ${cfg.dns.length} 条`);
   if (cfg.h2_routes) parts.push(`HTTP/2 自定义接口 ${cfg.h2_routes.length} 个`);
-  if (cfg.blocklist) parts.push(`黑名单 ${cfg.blocklist.length} 条`);
+
   if (cfg.wifi) parts.push('Wi-Fi 设置');
   if (!parts.length) { bkShowMsg('文件中没有可导入的段', false); return; }
   if (!confirm('将替换以下配置：\n- ' + parts.join('\n- ') + '\n\n确定导入？')) return;
@@ -923,12 +911,7 @@ $('bkFile').onchange = async () => {
       for (const r of cfg.h2_routes) await apiPost('/api/h2routes', { action: 'set', path: r.path, json: r.json });
       bkLog(`HTTP/2 自定义接口：已替换为 ${cfg.h2_routes.length} 个`);
     }
-    if (cfg.blocklist) {
-      const cur = await apiGet('/api/mon/block');
-      for (const b of cur.list) await apiPost('/api/mon/block', { action: 'del', domain: b.domain });
-      for (const d of cfg.blocklist) await apiPost('/api/mon/block', { action: 'add', domain: d });
-      bkLog(`黑名单：已替换为 ${cfg.blocklist.length} 条`);
-    }
+    if (cfg.ignoredBlocklist) bkLog('blocklist 段已忽略（黑名单只在记录页临时设置，不再保存）');
     if (cfg.wifi) {
       const w = cfg.wifi, f = {};
       if ('sta_ssid' in w) f.sta_ssid = w.sta_ssid;

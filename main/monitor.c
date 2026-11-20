@@ -43,7 +43,7 @@ static const char *TAG = "monitor";
 #define ASM_SLOTS       4
 #define ASM_CAP         2048            /* TLS ClientHello 重组上限 */
 #define LIVE_BUF        (128 * 1024)
-#define NVS_NS          "monblock"
+#define NVS_NS          "monblock"      /* 旧版本保存黑名单的命名空间，开机时清除 */
 
 typedef struct {
     bool used, online, has_mac;
@@ -774,27 +774,12 @@ void monitor_dns_answer(uint32_t log_id, const char *name, const uint32_t *ips, 
 
 /* ---------- 黑名单 ---------- */
 
-static void block_save(void)
+/* 黑名单只存内存，重启后清空；清除旧版本写入 NVS 的黑名单 */
+static void block_erase_old_nvs(void)
 {
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
-    nvs_set_blob(h, "list", s_block, sizeof(s_block));
-    nvs_set_u8(h, "count", (uint8_t)s_n_block);
-    nvs_commit(h);
-    nvs_close(h);
-}
-
-static void block_load(void)
-{
-    nvs_handle_t h;
-    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
-    uint8_t cnt = 0;
-    size_t len = sizeof(s_block);
-    if (nvs_get_u8(h, "count", &cnt) == ESP_OK && nvs_get_blob(h, "list", s_block, &len) == ESP_OK &&
-        len == sizeof(s_block) && cnt <= MON_BLOCK_MAX) {
-        s_n_block = cnt;
-        for (int i = 0; i < s_n_block; i++) s_block[i].name[MON_NAME_MAX] = '\0';
-    }
+    if (nvs_erase_all(h) == ESP_OK) nvs_commit(h);
     nvs_close(h);
 }
 
@@ -832,7 +817,6 @@ esp_err_t monitor_block_add(const char *domain, const char **err_msg)
             strlcpy(s_block[s_n_block].name, n, sizeof(s_block[0].name));
             s_block_hits[s_n_block] = 0;
             s_n_block++;
-            block_save();
             blockip_rebuild();
             reapply_flows();
             ESP_LOGI(TAG, "拉黑 %s", n);
@@ -854,7 +838,6 @@ esp_err_t monitor_block_del(const char *domain)
             memmove(&s_block_hits[i], &s_block_hits[i + 1], sizeof(s_block_hits[0]) * (s_n_block - i - 1));
             s_n_block--;
             memset(&s_block[s_n_block], 0, sizeof(s_block[0]));
-            block_save();
             blockip_rebuild();
             reapply_flows();
             ESP_LOGI(TAG, "解除拉黑 %s", n);
@@ -1171,7 +1154,7 @@ void monitor_init(esp_netif_t *ap)
     s_ap_mask = info.netmask.addr;
     s_ap_net = info.ip.addr & info.netmask.addr;
     s_ap_lwip = esp_netif_get_netif_impl(ap);
-    block_load();
+    block_erase_old_nvs();
 
     const esp_timer_create_args_t targs = { .callback = tick_cb, .name = "mon_tick" };
     esp_timer_handle_t t;
