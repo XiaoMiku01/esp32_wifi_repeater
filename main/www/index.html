@@ -214,20 +214,6 @@
     </section>
 
     <section class="card">
-      <h2>配置备份（YAML）</h2>
-      <p class="muted">导出文件包含 Wi-Fi 密码和网页上传的私钥（明文），请妥善保管。
-        导入时，文件中出现的段（wifi、dns、h2_site、h2_routes）会整体替换设备上对应的配置，未出现的段保持不变；
-        wifi 段最后应用，改了热点时当前连接会断开。</p>
-      <div class="row">
-        <button type="button" class="primary" id="bkExport">导出 YAML</button>
-        <button type="button" id="bkImportBtn">导入 YAML</button>
-        <input type="file" id="bkFile" accept=".yaml,.yml,.txt" style="display:none">
-      </div>
-      <div id="bkMsg"></div>
-      <ol id="bkLog"></ol>
-    </section>
-
-    <section class="card">
       <h2>DNS 自定义解析 <span class="muted" id="dnsCount"></span></h2>
       <p class="muted">列表中的域名由本机直接应答；未配置的域名照常转发到上游 DNS。仅对连接本机热点的设备生效。</p>
       <ul id="dnsList"></ul>
@@ -245,17 +231,33 @@
     </section>
   </div>
 
-  <section class="card log-card">
-    <div class="log-head">
-      <h2>实时日志 <span class="dot" id="wsDot"></span></h2>
+  <div style="display:grid; grid-template-columns:minmax(0,1fr); grid-template-rows:auto 1fr; gap:16px; min-width:0">
+    <section class="card">
+      <h2>配置备份（YAML）</h2>
+      <p class="muted">导出文件包含 Wi-Fi 密码和网页上传的私钥（明文），请妥善保管。
+        导入时，文件中出现的段（wifi、dns、h2_site、h2_routes）会整体替换设备上对应的配置，未出现的段保持不变；
+        wifi 段最后应用，改了热点时当前连接会断开。</p>
       <div class="row">
-        <label class="check" style="margin:0"><input type="checkbox" id="autoScroll" checked>自动滚动</label>
-        <button type="button" id="pauseBtn">暂停</button>
-        <button type="button" id="clearBtn">清空</button>
+        <button type="button" class="primary" id="bkExport">导出 YAML</button>
+        <button type="button" id="bkImportBtn">导入 YAML</button>
+        <input type="file" id="bkFile" accept=".yaml,.yml,.txt" style="display:none">
       </div>
-    </div>
-    <pre id="log"></pre>
-  </section>
+      <div id="bkMsg"></div>
+      <ol id="bkLog"></ol>
+    </section>
+
+    <section class="card log-card">
+      <div class="log-head">
+        <h2>实时日志 <span class="dot" id="wsDot"></span></h2>
+        <div class="row">
+          <label class="check" style="margin:0"><input type="checkbox" id="autoScroll" checked>自动滚动</label>
+          <button type="button" id="pauseBtn">暂停</button>
+          <button type="button" id="clearBtn">清空</button>
+        </div>
+      </div>
+      <pre id="log"></pre>
+    </section>
+  </div>
 </main>
 
 <script>
@@ -389,7 +391,6 @@ async function scan() {
 }
 $('scanBtn').onclick = scan;
 
-
 /* ---------- HTTP/2 自定义接口 ---------- */
 let rtInfo = { max: 8, max_json: 1024, routes: [] };
 const utf8Len = t => new TextEncoder().encode(t).length;
@@ -466,7 +467,6 @@ $('rtForm').onsubmit = async ev => {
 };
 rtLoad().catch(() => rtShowMsg('读取自定义接口失败', false));
 
-
 /* ---------- DNS 自定义解析 ---------- */
 let dnsInfo = { max: 16, ap_ip: '192.168.4.1', entries: [] };
 function dnsShowMsg(t, ok) { const m = $('dnsMsg'); m.textContent = t; m.className = ok ? 'ok' : 'bad'; }
@@ -515,7 +515,6 @@ $('dnsForm').onsubmit = async ev => {
   } catch (err) { dnsShowMsg(err.message, false); }
 };
 dnsLoad().catch(() => dnsShowMsg('读取自定义解析失败', false));
-
 
 /* ---------- HTTP/2 站点：域名与证书 ---------- */
 function siteShowMsg(t, cls) { const m = $('siteMsg'); m.textContent = t; m.className = cls; }
@@ -575,7 +574,6 @@ $('siteReset').onclick = async () => {
   } catch (e) { siteShowMsg(e.message, 'bad'); }
 };
 siteLoad().catch(() => siteShowMsg('读取站点信息失败', 'bad'));
-
 
 /* ---------- 配置备份：YAML 导出 / 导入 ---------- */
 
