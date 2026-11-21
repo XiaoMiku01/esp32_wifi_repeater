@@ -1,6 +1,6 @@
 # ESP32 Wi-Fi 中继
 
-基于 ESP32-S3 的 Wi-Fi 中继：STA 连接上游路由器，SoftAP 给下游设备上网（NAPT），
+基于 ESP32（S3 / C3 / C6）的 Wi-Fi 中继：STA 连接上游路由器，SoftAP 给下游设备上网（NAPT），
 附带网页配置、DNS 中继与自定义解析，以及一个同时支持 HTTP/2 和 HTTP/1.1 的 HTTPS 站点。
 
 > 配置页没有登录，也不加密传输；Wi-Fi 密码与上传的私钥以明文存放在 Flash 中。
@@ -38,15 +38,21 @@
 
 ## 硬件
 
-开发与测试使用的板子：
+支持 ESP32-S3、ESP32-C3、ESP32-C6，芯片相关配置在 `sdkconfig.defaults.<芯片>`
+（构建时自动叠加在通用的 `sdkconfig.defaults` 之后）：
 
-| 项目 | 值 |
-|---|---|
-| 芯片 | ESP32-S3，240 MHz 双核 |
-| Flash | 8 MB，**DIO** 模式 |
-| PSRAM | 2 MB，quad 模式 |
+| 芯片 | 默认配置 | 流量记录 |
+|---|---|---|
+| ESP32-S3 | 8 MB flash（DIO）、2 MB quad PSRAM、240 MHz（开发与测试用的板子） | 默认开启，记录表放 PSRAM |
+| ESP32-S3 N16R8 | 叠加 `sdkconfig.defaults.n16r8`：16 MB flash、8 MB octal PSRAM | 同上 |
+| ESP32-C3 / C6 | 4 MB flash（DIO）、无 PSRAM、160 MHz、TLS 缓冲按需分配 | 默认关闭，可在记录页开启；记录表放内部 RAM（约 52KB），容量较小（连接 64 条、DNS 记录 128 条） |
 
-其他 ESP32-S3 板子需要按实际情况修改 `sdkconfig.defaults` 中的 Flash / PSRAM 配置。
+C3 / C6 仅在编译层面验证过，尚未上板实测。
+
+流量记录关闭时，转发钩子直接放行，DNS 黑名单与记录页黑名单的 DNS 拦截照常生效，
+但不再按连接丢包和断开 TCP 连接。是否开机开启由 `CONFIG_REPEATER_MONITOR_DEFAULT_ON` 决定。
+
+其他板子按实际情况修改对应芯片的 `sdkconfig.defaults.<芯片>` 中的 Flash / PSRAM 配置。
 若 Flash 支持 QIO，可改用 `CONFIG_ESPTOOLPY_FLASHMODE_QIO`。
 
 ## 构建与烧录
@@ -70,6 +76,15 @@
    ```bash
    idf.py set-target esp32s3
    idf.py -p <串口> flash monitor
+   ```
+
+   每种芯片用独立的构建目录，互不影响（`build_*/` 已在 `.gitignore` 中）：
+
+   ```bash
+   idf.py -B build_c3 -D SDKCONFIG=build_c3/sdkconfig -D IDF_TARGET=esp32c3 -p <串口> flash monitor
+   idf.py -B build_c6 -D SDKCONFIG=build_c6/sdkconfig -D IDF_TARGET=esp32c6 -p <串口> flash monitor
+   idf.py -B build_n16r8 -D SDKCONFIG=build_n16r8/sdkconfig \
+          -D "SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.defaults.n16r8" -p <串口> flash monitor
    ```
 
    首次构建会通过组件管理器下载 `espressif/nghttp`（版本见 `dependencies.lock`）。

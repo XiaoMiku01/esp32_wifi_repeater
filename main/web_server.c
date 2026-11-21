@@ -673,11 +673,28 @@ static esp_err_t send_owned_json(httpd_req_t *req, char *buf, size_t len)
     return ret;
 }
 
+static bool chunk_writer(void *ctx, const char *data, size_t len)
+{
+    return httpd_resp_send_chunk((httpd_req_t *)ctx, data, len) == ESP_OK;
+}
+
+/* 记录数据分批序列化、分块发送（不在设备上拼出整个应答） */
+static esp_err_t send_streamed_json(httpd_req_t *req, esp_err_t err)
+{
+    if (err == ESP_ERR_NO_MEM) {
+        return send_json_error(req, "500 Internal Server Error", "内存不足");
+    }
+    if (err != ESP_OK) {
+        return ESP_FAIL;
+    }
+    return httpd_resp_send_chunk(req, NULL, 0);
+}
+
 static esp_err_t mon_live_get(httpd_req_t *req)
 {
-    size_t len = 0;
-    char *b = monitor_live_json(&len);
-    return send_owned_json(req, b, len);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return send_streamed_json(req, monitor_live_write(chunk_writer, req));
 }
 
 static esp_err_t mon_dns_get(httpd_req_t *req)
@@ -688,9 +705,9 @@ static esp_err_t mon_dns_get(httpd_req_t *req)
         httpd_query_key_value(q, "since", v, sizeof(v)) == ESP_OK) {
         since = strtoul(v, NULL, 10);
     }
-    size_t len = 0;
-    char *b = monitor_dns_json(since, &len);
-    return send_owned_json(req, b, len);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return send_streamed_json(req, monitor_dns_write(since, chunk_writer, req));
 }
 
 static esp_err_t mon_block_get(httpd_req_t *req)
@@ -754,7 +771,9 @@ static esp_err_t mon_ctl_post(httpd_req_t *req)
         return send_json_error(req, "400 Bad Request", "缺少 action");
     }
     if (strcmp(action, "enable") == 0) {
-        monitor_set_enabled(true);
+        if (monitor_set_enabled(true) != ESP_OK) {
+            return send_json_error(req, "500 Internal Server Error", "内存不足，无法开启记录");
+        }
     } else if (strcmp(action, "disable") == 0) {
         monitor_set_enabled(false);
     } else if (strcmp(action, "reset_perf") == 0) {

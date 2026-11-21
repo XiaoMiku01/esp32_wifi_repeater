@@ -6,7 +6,8 @@
  * - 连接：经本机转发的每条连接（5 元组），类型、域名（DNS 应答 / TLS SNI / HTTP Host）、
  *   实时上下行速率；由 lwIP 转发钩子 LWIP_HOOK_IP4_CANFORWARD 统计
  * - 黑名单（只存内存）：域名（含子域名）不再解析（NXDOMAIN）；已知 IP 与匹配的连接丢包，
- *   已建立的 TCP 连接向客户端发 RST 断开
+ *   已建立的 TCP 连接向客户端发 RST 断开（连接层面的拦截需开启记录）
+ * - 开机是否开启由 CONFIG_REPEATER_MONITOR_DEFAULT_ON 决定；记录表在首次开启时分配
  */
 #pragma once
 
@@ -45,13 +46,18 @@ void monitor_dns_answer(uint32_t log_id, const char *name, const uint32_t *ips, 
 esp_err_t monitor_block_add(const char *domain, const char **err_msg);
 esp_err_t monitor_block_del(const char *domain);
 
+/* JSON 分批输出：每批数据调用一次 w（不持锁），w 返回 false 时中止。
+ * 内存不足返回 ESP_ERR_NO_MEM（此时尚未调用 w），w 失败返回 ESP_FAIL */
+typedef bool (*monitor_write_fn)(void *ctx, const char *data, size_t len);
+esp_err_t monitor_live_write(monitor_write_fn w, void *ctx);
+esp_err_t monitor_dns_write(uint32_t since, monitor_write_fn w, void *ctx);
+
 /* JSON 输出，返回 malloc 的缓冲区，调用方 free */
-char *monitor_live_json(size_t *len);
-char *monitor_dns_json(uint32_t since, size_t *len);
 char *monitor_block_json(size_t *len);
 char *monitor_bench_json(size_t *len);
 
-void monitor_set_enabled(bool en);
+/* 开启时如记录表尚未分配则分配，内存不足返回 ESP_ERR_NO_MEM（保持关闭） */
+esp_err_t monitor_set_enabled(bool en);
 void monitor_reset_perf(void);
 
 /* lwIP 钩子（见 main/lwip_hook/monitor_lwip_hook.h） */

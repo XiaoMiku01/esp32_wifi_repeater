@@ -2,8 +2,10 @@
  * 流量记录与拦截，见 monitor.h
  *
  * 并发：所有表由 s_lock 保护。转发钩子运行在 lwIP tcpip 线程，持锁时间只做 O(1) 查表；
- * HTTP 读取时持锁把数据序列化到缓冲区（不在锁内做网络发送）。
- * 大表放 PSRAM；连接表用哈希桶（内部 RAM）定位。
+ * HTTP 读取时分批持锁序列化到小缓冲区，每批释放锁后再发送（不在锁内做网络发送，
+ * 也不长时间阻塞转发）。
+ * 大表放 PSRAM（没有 PSRAM 时放内部 RAM，容量按较小值分配）；连接表、IP -> 域名表
+ * 用哈希桶定位。记录表在首次开启记录时才分配（见 CONFIG_REPEATER_MONITOR_DEFAULT_ON）。
  */
 #include <string.h>
 #include <strings.h>
@@ -17,6 +19,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "esp_system.h"
 #include "esp_cpu.h"
 #include "esp_clk_tree.h"
 #include "nvs.h"
@@ -30,19 +33,32 @@
 #include "lwip/prot/tcp.h"
 #include "lwip/inet_chksum.h"
 #include "lwip/tcpip.h"
+#include "sdkconfig.h"
 #include "monitor.h"
 
 static const char *TAG = "monitor";
 
 #define CLIENT_MAX      32
-#define FLOW_MAX        256
+#if CONFIG_SPIRAM
+#define FLOW_MAX        256             /* 32 的倍数（占用位图） */
 #define FLOW_BUCKETS    512             /* 2 的幂 */
 #define DNSLOG_MAX      400
 #define IPMAP_MAX       512
-#define BLOCKIP_MAX     256
+#define IPMAP_BUCKETS   512             /* 2 的幂 */
 #define ASM_SLOTS       4
+#else
+/* 无 PSRAM（如 ESP32-C3/C6）：记录表放内部 RAM，按较小容量分配（开启时约 52KB） */
+#define FLOW_MAX        64
+#define FLOW_BUCKETS    128
+#define DNSLOG_MAX      128
+#define IPMAP_MAX       128
+#define IPMAP_BUCKETS   128
+#define ASM_SLOTS       2
+#endif
+#define BLOCKIP_MAX     256
 #define ASM_CAP         2048            /* TLS ClientHello 重组上限 */
-#define LIVE_BUF        (192 * 1024)    /* 256 条连接 × 含 URL 的 JSON */
+#define OUT_BUF         4096            /* JSON 分批输出缓冲 */
+#define OUT_RESERVE     1024            /* 单条记录 JSON 的上限（连接含 URL 约 800 字节） */
 #define URL_MAX         200
 #define NVS_NS          "monblock"      /* 旧版本保存黑名单的命名空间，开机时清除 */
 
@@ -81,9 +97,11 @@ typedef struct {
     char name[MON_NAME_MAX + 1];
 } dnslog_t;
 
+/* IP -> 域名：哈希链定位，按最近写入顺序淘汰（LRU 链表头为最久未写入） */
 typedef struct {
-    uint32_t ip, t;
-    char name[MON_NAME_MAX + 1];
+    uint32_t ip;
+    int16_t hnext, lprev, lnext;
+    char name[MON_NAME_MAX + 1];        /* 空表示未使用（不在哈希链中） */
 } ipmap_t;
 
 typedef struct {
@@ -98,18 +116,23 @@ typedef struct {
 } asm_t;
 
 static SemaphoreHandle_t s_lock;
-static bool s_ready;
-static volatile bool s_enabled = true;
+static bool s_ready;                    /* 已初始化（黑名单可用） */
+static volatile bool s_tables;          /* 记录表已分配 */
+static volatile bool s_enabled;
 static uint32_t s_ap_net, s_ap_mask;
 static struct netif *s_ap_lwip;
 
 static client_t *s_clients;
+static int s_last_client = -1;          /* 最近命中的客户端（转发钩子按 IP 查找的缓存） */
 static flow_t *s_flows;
+static uint32_t s_flow_bm[FLOW_MAX / 32];   /* 连接表占用位图 */
 static int16_t s_buckets[FLOW_BUCKETS];
 static uint32_t s_flow_seq;
 static dnslog_t *s_dns;
 static uint32_t s_dns_seq;
 static ipmap_t *s_ipmap;
+static int16_t s_ipmap_bkt[IPMAP_BUCKETS];
+static int16_t s_ipmap_lru_head, s_ipmap_lru_tail;
 static uint32_t s_blockip[BLOCKIP_MAX];
 static int s_n_blockip;
 static block_name_t s_block[MON_BLOCK_MAX];
@@ -123,9 +146,20 @@ static uint8_t s_scratch[ASM_CAP];
 static uint64_t s_perf_pkts, s_perf_cycles, s_perf_last_pkts, s_perf_samples;
 static uint32_t s_perf_max, s_perf_pps;
 
+/* 开机秒数，转发钩子每包都要调用。tick 为 100Hz 时用 tick 计数（32 位除法，约 497 天才回绕），
+ * 比 esp_timer 的 64 位除法便宜；tick 频率更高时回绕太快，仍用 esp_timer */
 static inline uint32_t now_s(void)
 {
+#if CONFIG_FREERTOS_HZ <= 100
+    return xTaskGetTickCount() / configTICK_RATE_HZ;
+#else
     return (uint32_t)(esp_timer_get_time() / 1000000);
+#endif
+}
+
+static inline bool flow_used(int i)
+{
+    return s_flow_bm[i >> 5] & (1u << (i & 31));
 }
 
 static void *ps_calloc(size_t n, size_t sz)
@@ -178,30 +212,66 @@ static int block_index(const char *name)
 
 /* ---------- IP -> 域名 ---------- */
 
-static const char *ipmap_get(uint32_t ip)
+static inline uint32_t ipmap_hash(uint32_t ip)
 {
-    for (int i = 0; i < IPMAP_MAX; i++) {
-        if (s_ipmap[i].ip == ip && s_ipmap[i].name[0]) {
-            return s_ipmap[i].name;
-        }
-    }
-    return NULL;
+    uint32_t h = ip * 2654435761u;
+    return (h ^ (h >> 16)) & (IPMAP_BUCKETS - 1);
 }
 
-static void ipmap_set(uint32_t ip, const char *name)
+static int ipmap_find(uint32_t ip)
 {
-    int slot = 0;
-    for (int i = 0; i < IPMAP_MAX; i++) {
+    for (int16_t i = s_ipmap_bkt[ipmap_hash(ip)]; i >= 0; i = s_ipmap[i].hnext) {
         if (s_ipmap[i].ip == ip) {
-            slot = i;
-            break;
-        }
-        if (s_ipmap[i].t < s_ipmap[slot].t) {
-            slot = i;
+            return i;
         }
     }
-    s_ipmap[slot].ip = ip;
-    s_ipmap[slot].t = now_s() + 1;      /* +1：区分从未使用的 0 */
+    return -1;
+}
+
+static const char *ipmap_get(uint32_t ip)
+{
+    int i = ipmap_find(ip);
+    return i >= 0 ? s_ipmap[i].name : NULL;
+}
+
+static void ipmap_lru_unlink(int i)
+{
+    ipmap_t *e = &s_ipmap[i];
+    if (e->lprev >= 0) s_ipmap[e->lprev].lnext = e->lnext; else s_ipmap_lru_head = e->lnext;
+    if (e->lnext >= 0) s_ipmap[e->lnext].lprev = e->lprev; else s_ipmap_lru_tail = e->lprev;
+}
+
+static void ipmap_lru_append(int i)
+{
+    ipmap_t *e = &s_ipmap[i];
+    e->lprev = s_ipmap_lru_tail;
+    e->lnext = -1;
+    if (s_ipmap_lru_tail >= 0) s_ipmap[s_ipmap_lru_tail].lnext = (int16_t)i; else s_ipmap_lru_head = (int16_t)i;
+    s_ipmap_lru_tail = (int16_t)i;
+}
+
+/* 已有该 IP 则更新域名，否则淘汰最久未写入的一条（未使用的条目排在最前） */
+static void ipmap_set(uint32_t ip, const char *name)
+{
+    if (!name[0]) {
+        return;                         /* 空名称表示未使用，不能入表 */
+    }
+    int slot = ipmap_find(ip);
+    if (slot < 0) {
+        slot = s_ipmap_lru_head;
+        ipmap_t *e = &s_ipmap[slot];
+        if (e->name[0]) {
+            int16_t *pp = &s_ipmap_bkt[ipmap_hash(e->ip)];
+            while (*pp != slot) pp = &s_ipmap[*pp].hnext;
+            *pp = e->hnext;
+        }
+        e->ip = ip;
+        uint32_t h = ipmap_hash(ip);
+        e->hnext = s_ipmap_bkt[h];
+        s_ipmap_bkt[h] = (int16_t)slot;
+    }
+    ipmap_lru_unlink(slot);
+    ipmap_lru_append(slot);
     strlcpy(s_ipmap[slot].name, name, sizeof(s_ipmap[slot].name));
 }
 
@@ -249,10 +319,16 @@ static client_t *client_alloc(void)
     return victim;
 }
 
+/* 非 0 的 IP 在表中唯一（monitor_on_ip 会合并或清掉重复的），缓存最近命中项 */
 static client_t *client_by_ip(uint32_t ip, bool create)
 {
+    int li = s_last_client;
+    if (li >= 0 && s_clients[li].used && s_clients[li].ip == ip) {
+        return &s_clients[li];
+    }
     for (int i = 0; i < CLIENT_MAX; i++) {
         if (s_clients[i].used && s_clients[i].ip == ip) {
+            s_last_client = i;
             return &s_clients[i];
         }
     }
@@ -287,7 +363,7 @@ static client_t *client_by_mac(const uint8_t mac[6], bool create)
 
 void monitor_on_join(const uint8_t mac[6])
 {
-    if (!s_ready) return;
+    if (!s_tables) return;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     client_t *c = client_by_mac(mac, true);
     if (c) {
@@ -299,7 +375,7 @@ void monitor_on_join(const uint8_t mac[6])
 
 void monitor_on_leave(const uint8_t mac[6])
 {
-    if (!s_ready) return;
+    if (!s_tables) return;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     client_t *c = client_by_mac(mac, false);
     if (c) {
@@ -312,7 +388,7 @@ void monitor_on_leave(const uint8_t mac[6])
 
 void monitor_on_ip(const uint8_t mac[6], uint32_t ip, const char *hostname)
 {
-    if (!s_ready) return;
+    if (!s_tables) return;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     client_t *c = client_by_mac(mac, true);
     if (c) {
@@ -379,26 +455,32 @@ static void flow_free(int idx)
         s_asm[f->asm_slot].flow = -1;
     }
     f->used = false;
+    s_flow_bm[idx >> 5] &= ~(1u << (idx & 31));
 }
 
 static flow_t *flow_create(uint32_t cip, uint32_t rip, uint16_t cp, uint16_t rp, uint8_t pr)
 {
-    int slot = -1, oldest = -1;
-    for (int i = 0; i < FLOW_MAX; i++) {
-        if (!s_flows[i].used) {
-            slot = i;
+    /* 取下标最小的空位（位图查找，不逐条访问 PSRAM 中的连接表） */
+    int slot = -1;
+    for (int w = 0; w < FLOW_MAX / 32; w++) {
+        if (~s_flow_bm[w]) {
+            slot = w * 32 + __builtin_ctz(~s_flow_bm[w]);
             break;
-        }
-        /* 表满时优先淘汰已关闭的，其次最久未活动的 */
-        if (oldest < 0 || (s_flows[i].closing && !s_flows[oldest].closing) ||
-            (s_flows[i].closing == s_flows[oldest].closing && s_flows[i].last < s_flows[oldest].last)) {
-            oldest = i;
         }
     }
     if (slot < 0) {
+        /* 表满时优先淘汰已关闭的，其次最久未活动的 */
+        int oldest = 0;
+        for (int i = 1; i < FLOW_MAX; i++) {
+            if ((s_flows[i].closing && !s_flows[oldest].closing) ||
+                (s_flows[i].closing == s_flows[oldest].closing && s_flows[i].last < s_flows[oldest].last)) {
+                oldest = i;
+            }
+        }
         slot = oldest;
         flow_free(slot);
     }
+    s_flow_bm[slot >> 5] |= 1u << (slot & 31);
     flow_t *f = &s_flows[slot];
     memset(f, 0, sizeof(*f));
     f->used = true;
@@ -791,6 +873,7 @@ int monitor_ip4_canforward(struct pbuf *p, uint32_t dest_host_order)
 
 static void tick_cb(void *arg)
 {
+    if (!s_tables) return;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     uint32_t now = now_s();
     s_perf_pps = (uint32_t)(s_perf_pkts - s_perf_last_pkts);
@@ -804,8 +887,8 @@ static void tick_cb(void *arg)
         c->last_down = c->down;
     }
     for (int i = 0; i < FLOW_MAX; i++) {
+        if (!flow_used(i)) continue;
         flow_t *f = &s_flows[i];
-        if (!f->used) continue;
         f->rup = (uint32_t)(f->up - f->last_up);
         f->rdown = (uint32_t)(f->down - f->last_down);
         f->last_up = f->up;
@@ -841,6 +924,14 @@ uint32_t monitor_dns_query(uint32_t client_ip, const char *name, uint16_t qtype,
         strlcpy(n, "(无效域名)", sizeof(n));
     }
     xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (res == MON_DNS_BLOCKED) {
+        int bi = block_index(n);
+        if (bi >= 0) s_block_hits[bi]++;
+    }
+    if (!s_tables) {
+        xSemaphoreGive(s_lock);
+        return 0;                       /* 记录未开启过：只统计黑名单命中 */
+    }
     uint32_t id = ++s_dns_seq;
     dnslog_t *e = &s_dns[id % DNSLOG_MAX];
     memset(e, 0, sizeof(*e));
@@ -854,10 +945,6 @@ uint32_t monitor_dns_query(uint32_t client_ip, const char *name, uint16_t qtype,
         e->ans[0] = local_ip;
         e->nans = 1;
     }
-    if (res == MON_DNS_BLOCKED) {
-        int bi = block_index(n);
-        if (bi >= 0) s_block_hits[bi]++;
-    }
     client_t *c = client_by_ip(client_ip, true);
     if (c) c->dns++;
     xSemaphoreGive(s_lock);
@@ -866,7 +953,7 @@ uint32_t monitor_dns_query(uint32_t client_ip, const char *name, uint16_t qtype,
 
 void monitor_dns_answer(uint32_t log_id, const char *name, const uint32_t *ips, int n)
 {
-    if (!s_ready || n <= 0) return;
+    if (!s_tables || log_id == 0 || n <= 0) return;
     char nm[MON_NAME_MAX + 1];
     bool ok = clean_name(name, strlen(name), nm);
     xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -896,8 +983,8 @@ static void block_erase_old_nvs(void)
 static void reapply_flows(void)
 {
     for (int i = 0; i < FLOW_MAX; i++) {
+        if (!flow_used(i)) continue;
         flow_t *f = &s_flows[i];
-        if (!f->used) continue;
         bool should = blockip_has(f->rip) || (f->domain[0] && block_index(f->domain) >= 0);
         if (should && !f->blocked) {
             mark_blocked(f);
@@ -926,8 +1013,10 @@ esp_err_t monitor_block_add(const char *domain, const char **err_msg)
             strlcpy(s_block[s_n_block].name, n, sizeof(s_block[0].name));
             s_block_hits[s_n_block] = 0;
             s_n_block++;
-            blockip_rebuild();
-            reapply_flows();
+            if (s_tables) {
+                blockip_rebuild();
+                reapply_flows();
+            }
             ESP_LOGI(TAG, "拉黑 %s", n);
         }
     }
@@ -947,8 +1036,10 @@ esp_err_t monitor_block_del(const char *domain)
             memmove(&s_block_hits[i], &s_block_hits[i + 1], sizeof(s_block_hits[0]) * (s_n_block - i - 1));
             s_n_block--;
             memset(&s_block[s_n_block], 0, sizeof(s_block[0]));
-            blockip_rebuild();
-            reapply_flows();
+            if (s_tables) {
+                blockip_rebuild();
+                reapply_flows();
+            }
             ESP_LOGI(TAG, "解除拉黑 %s", n);
             err = ESP_OK;
             break;
@@ -1013,13 +1104,30 @@ static const char *flow_type(const flow_t *f, char *buf)
     return buf;
 }
 
-char *monitor_live_json(size_t *len)
+/* 分批输出：缓冲区剩余不足一条记录时，释放锁、把已序列化的数据交给 w 发送，再重新持锁。
+ * 持锁调用，返回时仍持锁；发送失败返回 false */
+static bool sb_flush_unlocked(sb_t *s, monitor_write_fn w, void *ctx)
+{
+    xSemaphoreGive(s_lock);
+    bool ok = s->len == 0 || w(ctx, s->b, s->len);
+    s->len = 0;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    return ok;
+}
+
+static inline bool sb_need_flush(const sb_t *s)
+{
+    return s->len + OUT_RESERVE > s->cap;
+}
+
+esp_err_t monitor_live_write(monitor_write_fn w, void *ctx)
 {
     sb_t s;
-    if (!sb_init(&s, LIVE_BUF)) return NULL;
+    if (!sb_init(&s, OUT_BUF)) return ESP_ERR_NO_MEM;
     uint32_t mhz = 0;
     esp_clk_tree_src_get_freq_hz(SOC_MOD_CLK_CPU, ESP_CLK_TREE_SRC_FREQ_PRECISION_CACHED, &mhz);
     mhz /= 1000000;
+    bool ok = true;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     uint32_t avg = s_perf_samples ? (uint32_t)(s_perf_cycles / s_perf_samples) : 0;
     sb_printf(&s, "{\"uptime\":%lu,\"enabled\":%s,\"perf\":{\"pkts\":%llu,\"pps\":%lu,\"avg_cycles\":%lu,"
@@ -1028,7 +1136,8 @@ char *monitor_live_json(size_t *len)
               (unsigned long)s_perf_pps, (unsigned long)avg, (unsigned long)s_perf_max, (unsigned long)mhz);
     bool first = true;
     char ip[16];
-    for (int i = 0; i < CLIENT_MAX; i++) {
+    for (int i = 0; s_tables && ok && i < CLIENT_MAX; i++) {
+        if (sb_need_flush(&s) && !(ok = sb_flush_unlocked(&s, w, ctx))) break;
         client_t *c = &s_clients[i];
         if (!c->used) continue;
         ip_str(c->ip, ip);
@@ -1049,9 +1158,13 @@ char *monitor_live_json(size_t *len)
     first = true;
     static const char *const src_name[] = { "", "dns", "sni", "host" };
     char rip[16], tbuf[12];
-    for (int i = 0; i < FLOW_MAX; i++) {
+    for (int i = 0; s_tables && ok && i < FLOW_MAX; i++) {
+        if (!flow_used(i)) continue;
+        if (sb_need_flush(&s)) {
+            if (!(ok = sb_flush_unlocked(&s, w, ctx))) break;
+            if (!flow_used(i)) continue;        /* 释放锁期间可能已被回收 */
+        }
         flow_t *f = &s_flows[i];
-        if (!f->used) continue;
         ip_str(f->cip, ip);
         ip_str(f->rip, rip);
         sb_printf(&s, "%s{\"id\":%lu,\"cip\":\"%s\",\"cport\":%u,\"rip\":\"%s\",\"rport\":%u,\"type\":\"%s\","
@@ -1065,16 +1178,20 @@ char *monitor_live_json(size_t *len)
         first = false;
     }
     xSemaphoreGive(s_lock);
-    sb_printf(&s, "]}");
-    *len = s.len;
-    return s.b;
+    if (ok) {
+        sb_printf(&s, "]}");
+        ok = w(ctx, s.b, s.len);
+    }
+    free(s.b);
+    return ok ? ESP_OK : ESP_FAIL;
 }
 
-char *monitor_dns_json(uint32_t since, size_t *len)
+esp_err_t monitor_dns_write(uint32_t since, monitor_write_fn w, void *ctx)
 {
     sb_t s;
-    if (!sb_init(&s, 64 * 1024)) return NULL;
+    if (!sb_init(&s, OUT_BUF)) return ESP_ERR_NO_MEM;
     static const char *const res_name[] = { "forward", "local", "blocked", "filtered" };
+    bool ok = true;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     uint32_t last = s_dns_seq;
     uint32_t start = since + 1;
@@ -1082,7 +1199,8 @@ char *monitor_dns_json(uint32_t since, size_t *len)
     if (last >= 300 && start < last - 299) start = last - 299;     /* 单次最多 300 条 */
     sb_printf(&s, "{\"last\":%lu,\"entries\":[", (unsigned long)last);
     char ip[16];
-    for (uint32_t id = start; id <= last && id > 0; id++) {
+    for (uint32_t id = start; s_tables && id <= last && id > 0; id++) {
+        if (sb_need_flush(&s) && !(ok = sb_flush_unlocked(&s, w, ctx))) break;
         dnslog_t *e = &s_dns[id % DNSLOG_MAX];
         if (e->id != id) continue;
         ip_str(e->cip, ip);
@@ -1096,9 +1214,12 @@ char *monitor_dns_json(uint32_t since, size_t *len)
         sb_printf(&s, "]}");
     }
     xSemaphoreGive(s_lock);
-    sb_printf(&s, "]}");
-    *len = s.len;
-    return s.b;
+    if (ok) {
+        sb_printf(&s, "]}");
+        ok = w(ctx, s.b, s.len);
+    }
+    free(s.b);
+    return ok ? ESP_OK : ESP_FAIL;
 }
 
 char *monitor_block_json(size_t *len)
@@ -1117,10 +1238,60 @@ char *monitor_block_json(size_t *len)
     return s.b;
 }
 
-void monitor_set_enabled(bool en)
+/* 分配记录表（首次开启时）；持锁调用 */
+static bool tables_alloc_locked(void)
 {
+    if (s_tables) return true;
+    /* 实测放内部 RAM 与 PSRAM 每包耗时相同（中位数均为 7.5 µs），放 PSRAM 省内部 RAM */
+    client_t *clients = ps_calloc(CLIENT_MAX, sizeof(client_t));
+    flow_t *flows = ps_calloc(FLOW_MAX, sizeof(flow_t));
+    dnslog_t *dns = ps_calloc(DNSLOG_MAX, sizeof(dnslog_t));
+    ipmap_t *ipmap = ps_calloc(IPMAP_MAX, sizeof(ipmap_t));
+    asm_t *as = ps_calloc(ASM_SLOTS, sizeof(asm_t));
+    if (!clients || !flows || !dns || !ipmap || !as) {
+        free(clients);
+        free(flows);
+        free(dns);
+        free(ipmap);
+        free(as);
+        ESP_LOGE(TAG, "内存不足，流量记录不可用（剩余 %u 字节）", (unsigned)esp_get_free_heap_size());
+        return false;
+    }
+    for (int i = 0; i < FLOW_BUCKETS; i++) s_buckets[i] = -1;
+    for (int i = 0; i < ASM_SLOTS; i++) as[i].flow = -1;
+    for (int i = 0; i < IPMAP_BUCKETS; i++) s_ipmap_bkt[i] = -1;
+    /* LRU 初始按下标顺序，未使用的条目先被取用 */
+    for (int i = 0; i < IPMAP_MAX; i++) {
+        ipmap[i].hnext = -1;
+        ipmap[i].lprev = (int16_t)(i - 1);
+        ipmap[i].lnext = (int16_t)(i + 1 < IPMAP_MAX ? i + 1 : -1);
+    }
+    s_ipmap_lru_head = 0;
+    s_ipmap_lru_tail = IPMAP_MAX - 1;
+    memset(s_flow_bm, 0, sizeof(s_flow_bm));
+    s_clients = clients;
+    s_flows = flows;
+    s_dns = dns;
+    s_ipmap = ipmap;
+    s_asm = as;
+    s_tables = true;
+    blockip_rebuild();
+    ESP_LOGI(TAG, "记录表已分配：连接 %d 条，DNS 记录 %d 条", FLOW_MAX, DNSLOG_MAX);
+    return true;
+}
+
+esp_err_t monitor_set_enabled(bool en)
+{
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
+    if (en) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        bool ok = tables_alloc_locked();
+        xSemaphoreGive(s_lock);
+        if (!ok) return ESP_ERR_NO_MEM;
+    }
     s_enabled = en;
     ESP_LOGI(TAG, "流量记录 %s", en ? "开启" : "关闭");
+    return ESP_OK;
 }
 
 void monitor_reset_perf(void)
@@ -1129,11 +1300,16 @@ void monitor_reset_perf(void)
     s_perf_max = 0;
 }
 
-/* 合成包压测钩子开销：64 条连接，上下行交替。
- * 在绑定 core 1 的任务里运行（周期计数器按核独立），记录每个样本，报告中位数/p90/p99/最大值；
- * 结束后清除测试数据 */
+/* 合成包压测钩子开销：多条连接，上下行交替。
+ * 在绑定最后一个核的任务里运行（周期计数器按核独立），记录每个样本，报告中位数/p90/p99/最大值；
+ * 结束后清除测试数据。没有 PSRAM 时连接表较小，用较少的连接和轮数，避免挤掉真实连接 */
+#if CONFIG_SPIRAM
 #define BENCH_FLOWS   64
 #define BENCH_ROUNDS  300
+#else
+#define BENCH_FLOWS   16
+#define BENCH_ROUNDS  200
+#endif
 #define BENCH_N       (BENCH_FLOWS * BENCH_ROUNDS)
 
 typedef struct {
@@ -1183,8 +1359,13 @@ static int cmp_u32(const void *a, const void *b)
 
 char *monitor_bench_json(size_t *len)
 {
+    if (!s_ready) return NULL;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool ok = tables_alloc_locked();
+    xSemaphoreGive(s_lock);
+    if (!ok) return NULL;
     bench_ctx_t ctx = {
-        .samples = heap_caps_malloc(BENCH_N * sizeof(uint32_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+        .samples = ps_calloc(BENCH_N, sizeof(uint32_t)),
         .done = xSemaphoreCreateBinary(),
     };
     if (!ctx.samples || !ctx.done) {
@@ -1194,7 +1375,7 @@ char *monitor_bench_json(size_t *len)
     }
     bool was = s_enabled;
     s_enabled = true;
-    if (xTaskCreatePinnedToCore(bench_task, "mon_bench", 4096, &ctx, 5, NULL, 1) != pdPASS) {
+    if (xTaskCreatePinnedToCore(bench_task, "mon_bench", 4096, &ctx, 5, NULL, portNUM_PROCESSORS - 1) != pdPASS) {
         s_enabled = was;
         free(ctx.samples);
         vSemaphoreDelete(ctx.done);
@@ -1210,7 +1391,7 @@ char *monitor_bench_json(size_t *len)
     uint32_t bench_cip = s_ap_net | lwip_htonl(250);
     xSemaphoreTake(s_lock, portMAX_DELAY);
     for (int i = 0; i < FLOW_MAX; i++) {
-        if (s_flows[i].used && s_flows[i].cip == bench_cip) flow_free(i);
+        if (flow_used(i) && s_flows[i].cip == bench_cip) flow_free(i);
     }
     for (int i = 0; i < CLIENT_MAX; i++) {
         if (s_clients[i].used && s_clients[i].ip == bench_cip) s_clients[i].used = false;
@@ -1246,19 +1427,10 @@ char *monitor_bench_json(size_t *len)
 void monitor_init(esp_netif_t *ap)
 {
     s_lock = xSemaphoreCreateMutex();
-    /* 实测放内部 RAM 与 PSRAM 每包耗时相同（中位数均为 7.5 µs），放 PSRAM 省内部 RAM */
-    s_clients = ps_calloc(CLIENT_MAX, sizeof(client_t));
-    s_flows = ps_calloc(FLOW_MAX, sizeof(flow_t));
-    s_dns = ps_calloc(DNSLOG_MAX, sizeof(dnslog_t));
-    s_ipmap = ps_calloc(IPMAP_MAX, sizeof(ipmap_t));
-    s_asm = ps_calloc(ASM_SLOTS, sizeof(asm_t));
-    if (!s_lock || !s_clients || !s_flows || !s_dns || !s_ipmap || !s_asm) {
+    if (!s_lock) {
         ESP_LOGE(TAG, "内存不足，流量记录不可用");
         return;
     }
-    for (int i = 0; i < FLOW_BUCKETS; i++) s_buckets[i] = -1;
-    for (int i = 0; i < ASM_SLOTS; i++) s_asm[i].flow = -1;
-
     esp_netif_ip_info_t info;
     esp_netif_get_ip_info(ap, &info);
     s_ap_mask = info.netmask.addr;
@@ -1272,5 +1444,9 @@ void monitor_init(esp_netif_t *ap)
         esp_timer_start_periodic(t, 1000000);
     }
     s_ready = true;
-    ESP_LOGI(TAG, "流量记录已启动，黑名单 %d 条", s_n_block);
+#if CONFIG_REPEATER_MONITOR_DEFAULT_ON
+    monitor_set_enabled(true);
+#else
+    ESP_LOGI(TAG, "流量记录默认关闭，可在记录页开启");
+#endif
 }

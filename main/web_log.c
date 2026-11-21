@@ -35,26 +35,40 @@ static int log_vprintf(const char *fmt, va_list ap)
     va_copy(ap2, ap);
     int n = vsnprintf(line, sizeof(line), fmt, ap2);
     va_end(ap2);
+    /* 原输出为默认的 vprintf 且这一行没被截断时，直接写出已格式化的内容，不再格式化第二遍 */
+    bool reuse = s_orig_vprintf == vprintf && n >= 0 && n < (int)sizeof(line);
     if (n > 0) {
+        /* 不阻塞：缓冲满时丢弃 */
         if (n >= (int)sizeof(line)) {
             /* 超长行截断，补回换行，避免和下一行粘连 */
-            n = sizeof(line) - 1;
-            line[n - 1] = '\n';
+            char last = line[sizeof(line) - 2];
+            line[sizeof(line) - 2] = '\n';
+            xRingbufferSend(s_rb, line, sizeof(line) - 1, 0);
+            line[sizeof(line) - 2] = last;
+        } else {
+            xRingbufferSend(s_rb, line, n, 0);
         }
-        /* 不阻塞：缓冲满时丢弃 */
-        xRingbufferSend(s_rb, line, n, 0);
+    }
+    if (reuse) {
+        return n ? (int)fwrite(line, 1, n, stdout) : 0;
     }
     return s_orig_vprintf(fmt, ap);
 }
 
 static void hist_append(const char *data, size_t len)
 {
-    for (size_t i = 0; i < len; i++) {
-        s_hist[s_hist_head++] = data[i];
-        if (s_hist_head == HISTORY_SIZE) {
-            s_hist_head = 0;
-            s_hist_full = true;
-        }
+    if (len >= HISTORY_SIZE) {              /* 只保留最后 HISTORY_SIZE 字节 */
+        data += len - HISTORY_SIZE;
+        len = HISTORY_SIZE;
+    }
+    size_t first = HISTORY_SIZE - s_hist_head;
+    if (first > len) first = len;
+    memcpy(s_hist + s_hist_head, data, first);
+    memcpy(s_hist, data + first, len - first);
+    s_hist_head += len;
+    if (s_hist_head >= HISTORY_SIZE) {
+        s_hist_head -= HISTORY_SIZE;
+        s_hist_full = true;
     }
 }
 

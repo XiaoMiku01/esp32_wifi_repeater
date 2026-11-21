@@ -1,5 +1,5 @@
 /*
- * ESP32-S3 Wi-Fi 中继（APSTA + NAPT）
+ * ESP32 Wi-Fi 中继（APSTA + NAPT），支持 ESP32-S3 / C3 / C6
  *
  * STA 连上游路由器拿到 IP；SoftAP 给下游客户端分配 192.168.4.x，
  * lwIP NAPT 把 AP 侧流量地址转换后从 STA 发出。
