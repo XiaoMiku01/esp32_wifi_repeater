@@ -1,5 +1,6 @@
 # 构建产物
 build/
+build_*/
 # 由 sdkconfig.defaults 生成，配置以 defaults 为准
 sdkconfig
 sdkconfig.old
