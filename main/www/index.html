@@ -136,6 +136,23 @@
   #rtList li.flash { animation:hit-flash 2s ease-out; }
   #rtList .cnt { font-size:11px; padding:0 6px; border-radius:8px; background:#facc15; color:#111; white-space:nowrap; }
   #rtList .cnt:empty { display:none; }
+
+  /* 应答 JSON 可视化编辑（单层对象，布尔值） */
+  .seg { display:inline-flex; border:1px solid var(--line); border-radius:6px; overflow:hidden; margin-bottom:6px; }
+  .seg button { border:none; border-radius:0; padding:4px 12px; font-size:12px; }
+  .seg button + button { border-left:1px solid var(--line); }
+  .seg button.on { background:var(--accent-soft); color:var(--accent); font-weight:600; }
+  .jtree { border:1px solid var(--line); border-radius:6px; background:var(--bg); padding:8px; overflow-x:auto; }
+  .jtree[hidden], #rtJson[hidden] { display:none; }
+  .jrow { display:flex; align-items:center; gap:6px; margin:3px 0; flex-wrap:wrap; }
+  .jrow input[type=text] { width:auto; padding:4px 8px; font:12px/1.4 ui-monospace,Menlo,Consolas,monospace; }
+  .jrow .jk { flex:1 1 160px; min-width:90px; }
+  .jrow select { width:auto; padding:4px 6px; font-size:12px; }
+  .jrow button { padding:2px 8px; font-size:12px; }
+  .jadd { margin:4px 0 2px; padding:2px 10px; font-size:12px; color:var(--accent); }
+  @media (max-width: 760px) {
+    .jrow input[type=text], .jrow select { font-size:16px; }
+  }
   @keyframes hit-flash { from { background:rgba(250,204,21,.5); } to { background:transparent; } }
   #siteMsg.warn { color:var(--warn); }
   #bkLog { margin:6px 0 0; padding-left:18px; font-size:12px; color:var(--muted); }
@@ -349,13 +366,16 @@
         <div class="prefix-row"><span id="rtPrefix">https://…</span>
           <input type="text" id="rtPath" maxlength="64" placeholder="/api/hello" required></div>
         <label for="rtJson">应答 JSON</label>
-        <textarea id="rtJson" spellcheck="false" placeholder='{"hello": "world"}' required></textarea>
+        <div class="seg" id="rtMode"><button type="button" data-m="visual" class="on">可视化</button><button
+          type="button" data-m="source">源码</button></div>
+        <div id="rtTree" class="jtree"></div>
+        <textarea id="rtJson" spellcheck="false" placeholder='{"hello": "world"}' hidden></textarea>
         <div class="muted" id="rtSize"></div>
         <p class="muted">匹配规则：不区分请求方法和大小写，忽略结尾斜杠和查询串；路径中任意位置整段出现即命中，
           设置 /abc 时 /abc、/a/abc、/abc/x、/a/abc/x 都会命中（/xabc、/abcx 不命中），多条命中时取最长的一条。</p>
         <div class="row" style="margin-top:8px">
           <button type="submit" class="primary">保存接口</button>
-          <button type="button" id="rtFmt">格式化</button>
+          <button type="button" id="rtFmt" hidden>格式化</button>
           <button type="button" id="rtNew">清空</button>
         </div>
         <div id="rtMsg"></div>
@@ -545,6 +565,7 @@ let rtInfo = { max: 8, max_json: 1024, routes: [] };
 const utf8Len = t => new TextEncoder().encode(t).length;
 function rtShowMsg(t, ok) { const m = $('rtMsg'); m.textContent = t; m.className = ok ? 'ok' : 'bad'; }
 function rtCompact() {
+  if (rtMode === 'visual') return JSON.stringify(jlTo());
   const text = $('rtJson').value.trim();
   if (!text) throw new Error('JSON 不能为空');
   let obj;
@@ -559,8 +580,8 @@ function rtUpdateSize() {
 }
 function rtEdit(r) {
   $('rtPath').value = r.path;
-  try { $('rtJson').value = JSON.stringify(JSON.parse(r.json), null, 2); } catch (e) { $('rtJson').value = r.json; }
-  rtUpdateSize(); rtShowMsg('', true);
+  rtLoadJson(r.json);
+  rtShowMsg('', true);
 }
 function rtRender() {
   const ul = $('rtList'); ul.textContent = '';
@@ -596,12 +617,113 @@ async function rtPost(fields) {
   try { j = await r.json(); } catch (e) {}
   if (!r.ok || !j.ok) throw new Error(j.error || `请求失败（${r.status}）`);
 }
+/* ---------- 应答 JSON 可视化编辑：单层对象，值只有布尔 ----------
+ * 其他结构（嵌套、非布尔值、数组等）只能在源码模式编辑 */
+let rtMode = 'visual';
+let rtRows = [];                      /* [{k, v}] */
+
+/* 是否为可视化编辑支持的结构：单层对象，值全为布尔 */
+function jlFrom(x) {
+  if (!x || typeof x !== 'object' || Array.isArray(x)) return null;
+  const rows = [];
+  for (const k of Object.keys(x)) {
+    if (typeof x[k] !== 'boolean') return null;
+    rows.push({ k, v: x[k] });
+  }
+  return rows;
+}
+function jlTo() {
+  const o = {};
+  for (const r of rtRows) {
+    const k = r.k.trim();
+    if (!k) throw new Error('有字段名为空');
+    if (Object.prototype.hasOwnProperty.call(o, k)) throw new Error(`字段名“${k}”重复`);
+    o[k] = r.v;
+  }
+  return o;
+}
+function jlRender() {
+  const box = $('rtTree');
+  box.textContent = '';
+  rtRows.forEach((r, i) => {
+    const row = document.createElement('div'); row.className = 'jrow';
+    const k = document.createElement('input');
+    k.type = 'text'; k.className = 'jk'; k.value = r.k; k.placeholder = '字段名';
+    k.oninput = () => { r.k = k.value; jlSync(); };
+    const v = document.createElement('select');
+    for (const t of ['true', 'false']) { const o = document.createElement('option'); o.value = o.textContent = t; v.appendChild(o); }
+    v.value = String(r.v);
+    v.onchange = () => { r.v = v.value === 'true'; jlSync(); };
+    const del = document.createElement('button');
+    del.type = 'button'; del.textContent = '删除';
+    del.onclick = () => { rtRows.splice(i, 1); jlRender(); jlSync(); };
+    row.append(k, v, del);
+    box.appendChild(row);
+  });
+  const add = document.createElement('button');
+  add.type = 'button'; add.className = 'jadd'; add.textContent = '+ 添加字段';
+  add.onclick = () => {
+    rtRows.push({ k: '', v: true });
+    jlRender(); jlSync();
+    const ks = box.querySelectorAll('input.jk');
+    ks[ks.length - 1].focus();
+  };
+  box.appendChild(add);
+}
+/* 可视化 -> 源码（有错误时保留上一次的合法源码） */
+function jlSync() {
+  try { $('rtJson').value = JSON.stringify(jlTo(), null, 2); } catch (e) {}
+  rtUpdateSize();
+}
+function rtSetMode(m) {
+  if (m === rtMode) return true;
+  if (m === 'source') {
+    try { $('rtJson').value = JSON.stringify(jlTo(), null, 2); }
+    catch (e) { rtShowMsg(`请先修正：${e.message}`, false); return false; }
+  } else {
+    const text = $('rtJson').value.trim();
+    let rows;
+    try { rows = text ? jlFrom(JSON.parse(text)) : []; }
+    catch (e) { rtShowMsg('JSON 格式错误：' + e.message, false); return false; }
+    if (!rows) { rtShowMsg('可视化只支持单层对象、值为 true/false，当前 JSON 请在源码模式编辑', false); return false; }
+    rtRows = rows;
+    jlRender();
+  }
+  rtShowMode(m);
+  rtShowMsg('', true);
+  rtUpdateSize();
+  return true;
+}
+/* 只切换显示，不转换内容 */
+function rtShowMode(m) {
+  rtMode = m;
+  $('rtTree').hidden = m !== 'visual';
+  $('rtJson').hidden = m !== 'source';
+  $('rtFmt').hidden = m !== 'source';
+  for (const b of $('rtMode').children) b.classList.toggle('on', b.dataset.m === m);
+}
+$('rtMode').onclick = ev => { const m = ev.target.dataset && ev.target.dataset.m; if (m) rtSetMode(m); };
+/* 载入一段 JSON 文本（编辑、清空时用）：可视化支持的结构用列表编辑，否则切到源码 */
+function rtLoadJson(text) {
+  try { $('rtJson').value = text ? JSON.stringify(JSON.parse(text), null, 2) : ''; } catch (e) { $('rtJson').value = text; }
+  let rows = null;
+  try { rows = text ? jlFrom(JSON.parse(text)) : []; } catch (e) {}
+  if (rows) {
+    rtRows = rows;
+    rtShowMode('visual');
+    jlRender(); jlSync();
+  } else {
+    rtShowMode('source');          /* 嵌套或非布尔值：源码编辑，内容保持原样 */
+  }
+  rtUpdateSize();
+}
+
 $('rtJson').oninput = rtUpdateSize;
 $('rtFmt').onclick = () => {
   try { $('rtJson').value = JSON.stringify(JSON.parse(rtCompact()), null, 2); rtShowMsg('', true); }
   catch (e) { rtShowMsg(e.message, false); }
 };
-$('rtNew').onclick = () => { $('rtPath').value = ''; $('rtJson').value = ''; rtUpdateSize(); rtShowMsg('', true); };
+$('rtNew').onclick = () => { $('rtPath').value = ''; rtLoadJson(''); rtShowMsg('', true); };
 $('rtForm').onsubmit = async ev => {
   ev.preventDefault();
   let path = $('rtPath').value.trim();
@@ -617,6 +739,8 @@ $('rtForm').onsubmit = async ev => {
     await rtLoad();
   } catch (e) { rtShowMsg(e.message, false); }
 };
+jlRender();
+jlSync();
 rtLoad().catch(() => rtShowMsg('读取自定义接口失败', false));
 
 /* ---------- DNS 自定义解析 ---------- */
