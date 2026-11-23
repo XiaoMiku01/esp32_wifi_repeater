@@ -27,6 +27,9 @@
   - 应答：`Content-Type: application/json`、`X-Checksum: <md5(body)>`、`Cache-Control: no-store`，
     正文为压缩 JSON
   - 命中时实时日志高亮并弹出提示
+- **板载灯**（WS2812，默认 GPIO48，`CONFIG_REPEATER_LED_GPIO`）：`GET /api/led` 查看；
+  `POST /api/led` 带 `on=1|0` 或 `r=&g=&b=`（0-255），可带 `gpio=` 临时切换数据引脚；
+  `blink=<秒>` 彩色闪烁（0 停止）。自定义接口命中时自动彩色闪烁 10 秒（闪烁中再次命中重新计时），结束后恢复原来的颜色
 - **配置备份**：导出 / 导入 YAML（Wi-Fi、DNS 自定义解析、HTTPS 站点、自定义接口）
 - **记录页**（`http://192.168.4.1/monitor`，本次开机内的数据，只存内存）
   - 设备：接入热点的设备、IP、主机名、MAC、实时上下行速率、累计流量、DNS 查询数

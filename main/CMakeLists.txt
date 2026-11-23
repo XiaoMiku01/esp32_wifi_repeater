@@ -46,9 +46,10 @@ else()
 endif()
 
 idf_component_register(SRCS "wifi_repeater.c" "repeater_config.c" "web_log.c" "web_server.c"
-                            "dns_relay.c" "h2_test.c" "h2_routes.c" "h2_site.c" "monitor.c" "dns_filter.c"
+                            "dns_relay.c" "h2_test.c" "h2_routes.c" "h2_site.c" "monitor.c" "dns_filter.c" "led.c"
                     PRIV_REQUIRES esp_wifi esp_netif nvs_flash esp_psram esp_http_server esp_timer
                                   esp_ringbuf h2_server mbedtls lwip esp_hw_support
+                                  esp_driver_rmt esp_driver_gpio
                     INCLUDE_DIRS "."
                     EMBED_TXTFILES "www/index.html" "www/monitor.html" "${H2_CERT}" "${H2_KEY}")
 

@@ -20,6 +20,7 @@
 #include "esp_system.h"
 #include "nvs_flash.h"
 #include "repeater.h"
+#include "led.h"
 #include "h2_routes.h"
 #include "h2_site.h"
 #include "monitor.h"
@@ -321,6 +322,7 @@ void app_main(void)
     /* 客户端 DNS 指向 192.168.4.1（DHCP 默认下发），由中继转发到上游 DNS */
     dns_relay_start(s_netif_ap, s_netif_sta);
 
+    led_init(CONFIG_REPEATER_LED_GPIO);   /* 失败不影响中继 */
     ESP_ERROR_CHECK(web_server_start());
     /* 测试服务失败不影响中继 */
     h2_test_start();

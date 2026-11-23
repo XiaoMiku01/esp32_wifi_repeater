@@ -21,6 +21,11 @@ menu "Wi-Fi Repeater"
         range 1 15
         default 8
 
+    config REPEATER_LED_GPIO
+        int "板载 WS2812 灯数据引脚（开机默认，可用 /api/led 的 gpio= 临时切换）"
+        range 0 48
+        default 48
+
     config REPEATER_MONITOR_DEFAULT_ON
         bool "开机默认开启流量记录与拦截"
         default y if SPIRAM

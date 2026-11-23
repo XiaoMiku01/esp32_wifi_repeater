@@ -24,6 +24,9 @@
  *   POST /api/dnsblock  block=<每行一条>&allow=<每行一条>，整体替换
  *   GET  /api/export   导出全部配置 JSON（含 Wi-Fi 密码与网页上传的私钥），网页端转为 YAML；
  *                      导入由网页解析 YAML 后逐段调用上述接口完成
+ *   GET  /api/led      板载 WS2812 灯状态 {"gpio","r","g","b"}
+ *   POST /api/led      on=1|0 或 r=&g=&b=（0-255）；可带 gpio= 切换数据引脚；
+ *                      blink=<秒> 彩色闪烁（0 停止），自定义接口命中时自动闪烁 10 秒
  *   GET  /ws           WebSocket，推送实时日志（二进制帧，UTF-8 文本）
  */
 #include <string.h>
@@ -41,6 +44,7 @@
 #include "h2_site.h"
 #include "monitor.h"
 #include "dns_filter.h"
+#include "led.h"
 #include "lwip/inet.h"
 
 static const char *TAG = "web";
@@ -792,6 +796,82 @@ static esp_err_t mon_bench_get(httpd_req_t *req)
     return send_owned_json(req, b, len);
 }
 
+/* ---------- 板载灯 ---------- */
+
+static esp_err_t led_send_state(httpd_req_t *req)
+{
+    int gpio;
+    uint8_t r, g, b;
+    led_get(&gpio, &r, &g, &b);
+    char buf[112];
+    snprintf(buf, sizeof(buf), "{\"ok\":true,\"gpio\":%d,\"r\":%u,\"g\":%u,\"b\":%u,\"blinking\":%s}",
+             gpio, r, g, b, led_blinking() ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, buf);
+}
+
+static esp_err_t led_get_handler(httpd_req_t *req)
+{
+    return led_send_state(req);
+}
+
+/* 读取 0..max 的整数字段：不存在返回 0，成功返回 1，非法返回 -1 */
+static int form_get_int(const char *body, const char *key, int max, int *out)
+{
+    char v[8], *end;
+    int rc = form_get(body, key, v, sizeof(v));
+    if (rc <= 0) {
+        return rc;
+    }
+    long n = strtol(v, &end, 10);
+    if (v[0] == '\0' || *end != '\0' || n < 0 || n > max) {
+        return -1;
+    }
+    *out = (int)n;
+    return 1;
+}
+
+static esp_err_t led_post_handler(httpd_req_t *req)
+{
+    char body[96];
+    if (recv_small_body(req, body, sizeof(body)) < 0) {
+        return send_json_error(req, "400 Bad Request", "请求体为空或过长");
+    }
+    int gpio, on, r = 0, g = 0, b = 0;
+    int rg = form_get_int(body, "gpio", 48, &gpio);
+    int ro = form_get_int(body, "on", 1, &on);
+    int rr = form_get_int(body, "r", 255, &r);
+    int rgn = form_get_int(body, "g", 255, &g);
+    int rb = form_get_int(body, "b", 255, &b);
+    int bl, rbl = form_get_int(body, "blink", 600, &bl);
+    if (rg < 0 || ro < 0 || rr < 0 || rgn < 0 || rb < 0 || rbl < 0) {
+        return send_json_error(req, "400 Bad Request",
+                               "参数非法：on 为 0/1，r/g/b 为 0-255，gpio 为 0-48，blink 为 0-600 秒");
+    }
+    if (rg > 0 && led_set_gpio(gpio) != ESP_OK) {
+        return send_json_error(req, "400 Bad Request", "该 GPIO 不能用作输出");
+    }
+    esp_err_t err = ESP_OK;
+    if (ro > 0) {
+        err = on ? led_set_rgb(32, 32, 32) : led_set_rgb(0, 0, 0);
+    } else if (rr > 0 || rgn > 0 || rb > 0) {
+        err = led_set_rgb(r, g, b);
+    }
+    if (err == ESP_OK && rbl > 0) {
+        if (bl > 0) {
+            err = led_blink((uint32_t)bl * 1000);
+        } else {
+            int cg; uint8_t cr, cgg, cb;   /* blink=0：停止闪烁，恢复设置的颜色 */
+            led_get(&cg, &cr, &cgg, &cb);
+            err = led_set_rgb(cr, cgg, cb);
+        }
+    }
+    if (err != ESP_OK) {
+        return send_json_error(req, "500 Internal Server Error", esp_err_to_name(err));
+    }
+    return led_send_state(req);
+}
+
 /* ---------- DNS 黑名单 ---------- */
 
 /* GET：列表；带 ?test=<域名> 时按 DNS 中继的判定顺序给出该域名的处理结果 */
@@ -977,6 +1057,8 @@ esp_err_t web_server_start(void)
         { .uri = "/api/mon/block", .method = HTTP_POST, .handler = mon_block_post },
         { .uri = "/api/mon/ctl",   .method = HTTP_POST, .handler = mon_ctl_post },
         { .uri = "/api/mon/bench", .method = HTTP_GET,  .handler = mon_bench_get },
+        { .uri = "/api/led",       .method = HTTP_GET,  .handler = led_get_handler },
+        { .uri = "/api/led",       .method = HTTP_POST, .handler = led_post_handler },
         { .uri = "/ws",          .method = HTTP_GET,  .handler = ws_handler, .is_websocket = true,
           .ws_post_handshake_cb = ws_post_handshake },
     };

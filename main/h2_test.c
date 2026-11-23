@@ -19,6 +19,9 @@
 #include "repeater.h"
 #include "h2_routes.h"
 #include "h2_site.h"
+#include "led.h"
+
+#define LED_HIT_BLINK_MS 10000   /* 自定义接口命中后板载灯闪烁时长 */
 
 static const char *TAG = "h2_test";
 
@@ -108,6 +111,7 @@ static void send_custom_json(const char *matched, const char *json, const char *
     /* 固定格式，配置页据此高亮并提示；配置路径不含空白，请求路径（可能含解码出的空格）放最后 */
     ESP_LOGI(TAG, "HIT path=%s method=%s proto=%s peer=%s req=%s", matched, h2_req_method(req),
              h2_req_proto(req), h2_req_peer(req), h2_req_path(req));
+    led_blink(LED_HIT_BLINK_MS);
     h2_resp_add_header(req, "x-checksum", md5);
     h2_resp_add_header(req, "cache-control", "no-store");
     h2_resp_sendstr(req, 200, "application/json", json);
