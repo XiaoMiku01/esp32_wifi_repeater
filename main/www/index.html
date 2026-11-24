@@ -137,7 +137,7 @@
   #rtList .cnt { font-size:11px; padding:0 6px; border-radius:8px; background:#facc15; color:#111; white-space:nowrap; }
   #rtList .cnt:empty { display:none; }
 
-  /* 应答 JSON 可视化编辑（单层对象，布尔值） */
+  /* 应答 JSON 可视化编辑（单层对象，值为布尔或字符串） */
   .seg { display:inline-flex; border:1px solid var(--line); border-radius:6px; overflow:hidden; margin-bottom:6px; }
   .seg button { border:none; border-radius:0; padding:4px 12px; font-size:12px; }
   .seg button + button { border-left:1px solid var(--line); }
@@ -147,6 +147,8 @@
   .jrow { display:flex; align-items:center; gap:6px; margin:3px 0; flex-wrap:wrap; }
   .jrow input[type=text] { width:auto; padding:4px 8px; font:12px/1.4 ui-monospace,Menlo,Consolas,monospace; }
   .jrow .jk { flex:1 1 160px; min-width:90px; }
+  .jrow .jv { flex:2 1 200px; min-width:120px; }
+  .jrow .jv[hidden] { display:none; }
   .jrow select { width:auto; padding:4px 6px; font-size:12px; }
   .jrow button { padding:2px 8px; font-size:12px; }
   .jadd { margin:4px 0 2px; padding:2px 10px; font-size:12px; color:var(--accent); }
@@ -617,17 +619,17 @@ async function rtPost(fields) {
   try { j = await r.json(); } catch (e) {}
   if (!r.ok || !j.ok) throw new Error(j.error || `请求失败（${r.status}）`);
 }
-/* ---------- 应答 JSON 可视化编辑：单层对象，值只有布尔 ----------
- * 其他结构（嵌套、非布尔值、数组等）只能在源码模式编辑 */
+/* ---------- 应答 JSON 可视化编辑：单层对象，值为布尔或字符串 ----------
+ * 其他结构（嵌套、数字、null、数组等）只能在源码模式编辑 */
 let rtMode = 'visual';
-let rtRows = [];                      /* [{k, v}] */
+let rtRows = [];                      /* [{k, v}]，v 为 boolean 或 string */
 
-/* 是否为可视化编辑支持的结构：单层对象，值全为布尔 */
+/* 是否为可视化编辑支持的结构：单层对象，值全为布尔或字符串 */
 function jlFrom(x) {
   if (!x || typeof x !== 'object' || Array.isArray(x)) return null;
   const rows = [];
   for (const k of Object.keys(x)) {
-    if (typeof x[k] !== 'boolean') return null;
+    if (typeof x[k] !== 'boolean' && typeof x[k] !== 'string') return null;
     rows.push({ k, v: x[k] });
   }
   return rows;
@@ -651,13 +653,25 @@ function jlRender() {
     k.type = 'text'; k.className = 'jk'; k.value = r.k; k.placeholder = '字段名';
     k.oninput = () => { r.k = k.value; jlSync(); };
     const v = document.createElement('select');
-    for (const t of ['true', 'false']) { const o = document.createElement('option'); o.value = o.textContent = t; v.appendChild(o); }
-    v.value = String(r.v);
-    v.onchange = () => { r.v = v.value === 'true'; jlSync(); };
+    for (const [val, txt] of [['true', 'true'], ['false', 'false'], ['str', '字符串']]) {
+      const o = document.createElement('option'); o.value = val; o.textContent = txt; v.appendChild(o);
+    }
+    const s = document.createElement('input');
+    s.type = 'text'; s.className = 'jv'; s.placeholder = '字符串值';
+    const isStr = typeof r.v === 'string';
+    v.value = isStr ? 'str' : String(r.v);
+    s.value = isStr ? r.v : '';
+    s.hidden = !isStr;
+    v.onchange = () => {
+      if (v.value === 'str') { r.v = s.value; s.hidden = false; s.focus(); }
+      else { r.v = v.value === 'true'; s.hidden = true; }
+      jlSync();
+    };
+    s.oninput = () => { r.v = s.value; jlSync(); };
     const del = document.createElement('button');
     del.type = 'button'; del.textContent = '删除';
     del.onclick = () => { rtRows.splice(i, 1); jlRender(); jlSync(); };
-    row.append(k, v, del);
+    row.append(k, v, s, del);
     box.appendChild(row);
   });
   const add = document.createElement('button');
@@ -685,7 +699,7 @@ function rtSetMode(m) {
     let rows;
     try { rows = text ? jlFrom(JSON.parse(text)) : []; }
     catch (e) { rtShowMsg('JSON 格式错误：' + e.message, false); return false; }
-    if (!rows) { rtShowMsg('可视化只支持单层对象、值为 true/false，当前 JSON 请在源码模式编辑', false); return false; }
+    if (!rows) { rtShowMsg('可视化只支持单层对象、值为 true/false 或字符串，当前 JSON 请在源码模式编辑', false); return false; }
     rtRows = rows;
     jlRender();
   }
@@ -713,7 +727,7 @@ function rtLoadJson(text) {
     rtShowMode('visual');
     jlRender(); jlSync();
   } else {
-    rtShowMode('source');          /* 嵌套或非布尔值：源码编辑，内容保持原样 */
+    rtShowMode('source');          /* 嵌套或其他类型的值：源码编辑，内容保持原样 */
   }
   rtUpdateSize();
 }
