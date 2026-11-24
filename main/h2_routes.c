@@ -127,7 +127,7 @@ static const char *validate(const char *path, const char *json)
     }
     size_t jl = strlen(json);
     if (jl == 0 || jl > H2_ROUTE_JSON_MAX) {
-        return "JSON 不能为空，压缩后不超过 1024 字节";
+        return "JSON 不能为空，压缩后不超过 2048 字节";
     }
     return NULL;
 }

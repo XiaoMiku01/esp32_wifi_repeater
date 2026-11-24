@@ -5,7 +5,7 @@
 
 #define H2_ROUTES_MAX       8
 #define H2_ROUTE_PATH_MAX   64
-#define H2_ROUTE_JSON_MAX   1024
+#define H2_ROUTE_JSON_MAX   2048
 
 /* 从 NVS 加载，须在 h2 站点和配置页启动前调用 */
 void h2_routes_init(void);

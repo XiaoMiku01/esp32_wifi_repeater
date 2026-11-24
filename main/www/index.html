@@ -561,7 +561,7 @@ async function scan() {
 $('scanBtn').onclick = scan;
 
 /* ---------- HTTP/2 自定义接口 ---------- */
-let rtInfo = { max: 8, max_json: 1024, routes: [] };
+let rtInfo = { max: 8, max_json: 2048, routes: [] };
 const utf8Len = t => new TextEncoder().encode(t).length;
 function rtShowMsg(t, ok) { const m = $('rtMsg'); m.textContent = t; m.className = ok ? 'ok' : 'bad'; }
 function rtCompact() {
