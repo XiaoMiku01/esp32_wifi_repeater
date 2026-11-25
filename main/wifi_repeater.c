@@ -27,7 +27,16 @@
 #include "monitor.h"
 #include "dns_filter.h"
 
-#define RECONNECT_DELAY_MS  3000
+/* 上游没连上时的探测：每隔 PROBE_INTERVAL_MS 只扫一个信道（定向探测上游 SSID，最多 PROBE_DWELL_MS），
+ * 1-13 信道轮流；探测到之后才在那个信道上发起连接。
+ * 不能直接反复 esp_wifi_connect()：它每次都全信道扫描 2-3 秒，射频离开热点信道，
+ * 3 秒重试一次时热点基本不可用（实测车机无法接入）。逐信道探测每秒最多离开热点信道约 0.1 秒 */
+#define PROBE_INTERVAL_MS   1000
+#define PROBE_DWELL_MS      100
+#define PROBE_CH_MAX        13
+#define CONNECT_TIMEOUT_MS  20000
+/* 探测到上游但连接失败（密码错、被拒绝等）后，再次尝试前的等待（秒），按连续失败次数递增 */
+static const uint8_t s_conn_backoff_s[] = { 0, 5, 15, 30, 60 };
 #define APPLY_DELAY_MS      500   /* 先让 HTTP 响应发出去再动 Wi-Fi */
 
 static const char *TAG = "repeater";
@@ -37,8 +46,14 @@ static esp_netif_t *s_netif_sta;
 static repeater_cfg_t s_cfg;
 static SemaphoreHandle_t s_cfg_lock;
 static volatile bool s_sta_connected;
-static volatile bool s_scanning;        /* 扫描期间暂停自动重连 */
-static SemaphoreHandle_t s_scan_lock;
+static volatile bool s_scanning;        /* 配置页扫描期间暂停上游探测 */
+static SemaphoreHandle_t s_scan_lock;   /* 配置页扫描、上游探测 / 连接、应用新配置互斥 */
+static TaskHandle_t s_upstream_task;
+static volatile bool s_connecting;          /* 已发起连接，等结果 */
+static volatile bool s_direct_connect;      /* 开机 / 改配置后：直接连一次（全信道扫描），不逐信道探测 */
+static volatile bool s_probe_home_first;    /* 刚掉线：先探测当前信道 */
+static volatile uint32_t s_conn_fails;      /* 探测到上游后连接连续失败次数 */
+static volatile uint32_t s_cfg_gen;         /* 上游配置变更计数，打断连接失败后的等待 */
 
 static void fill_wifi_configs(const repeater_cfg_t *c, wifi_config_t *ap, wifi_config_t *sta)
 {
@@ -61,13 +76,129 @@ static void fill_wifi_configs(const repeater_cfg_t *c, wifi_config_t *ap, wifi_c
     sta->sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
 }
 
-static void reconnect_task(void *arg)
+static void upstream_kick(void)
 {
-    vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
-    if (!s_scanning) {          /* 扫描结束后由扫描函数负责重连 */
-        esp_wifi_connect();
+    if (s_upstream_task) {
+        xTaskNotifyGive(s_upstream_task);
     }
-    vTaskDelete(NULL);
+}
+
+/* 在指定信道上探测上游 SSID，找到时返回 true 并给出信号最强的那个 AP */
+static bool probe_channel(const wifi_config_t *base, uint8_t ch, wifi_ap_record_t *found)
+{
+    wifi_scan_config_t sc = {
+        .ssid = (uint8_t *)base->sta.ssid,
+        .channel = ch,
+        .show_hidden = true,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+        .scan_time = { .active = { .min = PROBE_DWELL_MS / 2, .max = PROBE_DWELL_MS } },
+    };
+    if (esp_wifi_scan_start(&sc, true) != ESP_OK) {
+        return false;
+    }
+    wifi_ap_record_t recs[4];
+    uint16_t num = 4;
+    if (esp_wifi_scan_get_ap_records(&num, recs) != ESP_OK || num == 0) {
+        esp_wifi_clear_ap_list();
+        return false;
+    }
+    int best = 0;
+    for (int i = 1; i < num; i++) {
+        if (recs[i].rssi > recs[best].rssi) {
+            best = i;
+        }
+    }
+    *found = recs[best];
+    return true;
+}
+
+/* 等待 ms 毫秒；上游配置变了或被要求直接连接时提前返回 */
+static void upstream_wait(uint32_t ms, uint32_t gen)
+{
+    for (uint32_t t = 0; t < ms && gen == s_cfg_gen && !s_direct_connect && !s_sta_connected; t += 100) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+/* 上游连接维护：没连上时逐信道探测，探测到再连（见 PROBE_INTERVAL_MS 处的说明） */
+static void upstream_task(void *arg)
+{
+    uint8_t ch = 0;
+    for (;;) {
+        if (s_sta_connected) {
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            continue;
+        }
+        if (s_connecting) {
+            /* 结果由事件给出：连上（GOT_IP）或失败（DISCONNECTED，清 s_connecting） */
+            if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(CONNECT_TIMEOUT_MS)) == 0 && s_connecting && !s_sta_connected) {
+                ESP_LOGW(TAG, "连接上游超时，中止");
+                s_connecting = false;
+                s_conn_fails++;
+                esp_wifi_disconnect();
+            }
+            continue;
+        }
+        if (s_scanning) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+
+        uint32_t gen = s_cfg_gen;
+        if (s_direct_connect) {
+            xSemaphoreTake(s_scan_lock, portMAX_DELAY);
+            s_direct_connect = false;
+            s_conn_fails = 0;
+            s_connecting = true;
+            if (esp_wifi_connect() != ESP_OK) {
+                s_connecting = false;
+            }
+            xSemaphoreGive(s_scan_lock);
+            continue;
+        }
+
+        size_t steps = sizeof(s_conn_backoff_s) / sizeof(s_conn_backoff_s[0]);
+        uint32_t fails = s_conn_fails;
+        upstream_wait(s_conn_backoff_s[fails < steps ? fails : steps - 1] * 1000u, gen);
+        if (gen != s_cfg_gen || s_direct_connect || s_sta_connected) {
+            continue;
+        }
+
+        if (s_probe_home_first) {
+            /* 刚掉线：上游多半还在原信道，先探测当前信道（不用离开热点信道） */
+            s_probe_home_first = false;
+            wifi_second_chan_t second;
+            if (esp_wifi_get_channel(&ch, &second) != ESP_OK || ch < 1 || ch > PROBE_CH_MAX) {
+                ch = 1;
+            }
+        } else {
+            ch = ch % PROBE_CH_MAX + 1;
+        }
+
+        bool found = false;
+        xSemaphoreTake(s_scan_lock, portMAX_DELAY);
+        wifi_config_t sta;
+        wifi_ap_record_t rec;
+        if (!s_sta_connected && !s_direct_connect && gen == s_cfg_gen &&
+            esp_wifi_get_config(WIFI_IF_STA, &sta) == ESP_OK && sta.sta.ssid[0] &&
+            probe_channel(&sta, ch, &rec)) {
+            found = true;
+            sta.sta.channel = rec.primary;
+            sta.sta.scan_method = WIFI_FAST_SCAN;       /* 信道已知，在这个信道上找到就连，不再全信道扫描 */
+            sta.sta.bssid_set = true;
+            memcpy(sta.sta.bssid, rec.bssid, sizeof(sta.sta.bssid));
+            ESP_LOGI(TAG, "探测到上游 \"%s\"（信道 %d，信号 %d dBm），开始连接", (char *)rec.ssid, rec.primary, rec.rssi);
+            s_connecting = true;
+            if (esp_wifi_set_config(WIFI_IF_STA, &sta) != ESP_OK || esp_wifi_connect() != ESP_OK) {
+                s_connecting = false;
+                s_conn_fails++;
+            }
+        }
+        xSemaphoreGive(s_scan_lock);
+        if (!found) {
+            upstream_wait(PROBE_INTERVAL_MS, gen);
+        }
+    }
 }
 
 static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -75,14 +206,21 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
     if (base == WIFI_EVENT) {
         switch (id) {
         case WIFI_EVENT_STA_START:
-            esp_wifi_connect();
+            s_direct_connect = true;        /* 开机时还没有客户端，直接连一次最快 */
+            upstream_kick();
             break;
         case WIFI_EVENT_STA_DISCONNECTED: {
             wifi_event_sta_disconnected_t *e = data;
+            if (s_sta_connected) {
+                s_probe_home_first = true;
+                ESP_LOGW(TAG, "上游断开 reason=%d，开始逐信道探测", e->reason);
+            } else if (s_connecting) {
+                s_conn_fails++;
+                ESP_LOGW(TAG, "连接上游失败 reason=%d", e->reason);
+            }
             s_sta_connected = false;
-            ESP_LOGW(TAG, "上游断开 reason=%d，%d ms 后重连", e->reason, RECONNECT_DELAY_MS);
-            /* 不在事件循环里阻塞等待 */
-            xTaskCreate(reconnect_task, "reconnect", 2048, NULL, 3, NULL);
+            s_connecting = false;
+            upstream_kick();
             break;
         }
         case WIFI_EVENT_AP_STACONNECTED: {
@@ -104,6 +242,8 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
         if (id == IP_EVENT_STA_GOT_IP) {
             ip_event_got_ip_t *e = data;
             s_sta_connected = true;
+            s_connecting = false;
+            s_conn_fails = 0;
             ESP_LOGI(TAG, "上游已连接，STA IP: " IPSTR " GW: " IPSTR,
                      IP2STR(&e->ip_info.ip), IP2STR(&e->ip_info.gw));
         } else if (id == IP_EVENT_ASSIGNED_IP_TO_CLIENT) {
@@ -134,12 +274,18 @@ static void apply_task(void *arg)
     fill_wifi_configs(&c, &ap, &sta);
 
     ESP_LOGI(TAG, "应用新配置：上游 \"%s\"，AP \"%s\"", c.sta_ssid, c.ap_ssid);
+    xSemaphoreTake(s_scan_lock, portMAX_DELAY);     /* 不与上游探测 / 连接同时改配置 */
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_config(WIFI_IF_AP, &ap));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_config(WIFI_IF_STA, &sta));
     if (sta_changed) {
-        /* 触发 DISCONNECTED 事件，由重连逻辑用新配置连接 */
+        /* 换了上游：断开当前连接（或中止进行中的连接），由上游任务用新配置直接连一次。
+         * 没改上游时不动 STA 配置：里面可能带着探测时写入的信道和 BSSID */
+        s_cfg_gen++;
+        s_direct_connect = true;
         esp_wifi_disconnect();
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_config(WIFI_IF_STA, &sta));
     }
+    xSemaphoreGive(s_scan_lock);
+    upstream_kick();
     vTaskDelete(NULL);
 }
 
@@ -264,10 +410,8 @@ int repeater_scan(repeater_scan_item_t *out, int max)
     }
 
     s_scanning = false;
-    if (!s_sta_connected) {
-        esp_wifi_connect();
-    }
     xSemaphoreGive(s_scan_lock);
+    upstream_kick();            /* 没连上时由上游任务继续探测 */
     return n_out;
 }
 
@@ -287,6 +431,7 @@ void app_main(void)
 
     s_cfg_lock = xSemaphoreCreateMutex();
     s_scan_lock = xSemaphoreCreateMutex();
+    xTaskCreate(upstream_task, "upstream", 4096, NULL, 3, &s_upstream_task);
     repeater_cfg_load(&s_cfg);
     h2_routes_init();
     dns_relay_load_overrides();
