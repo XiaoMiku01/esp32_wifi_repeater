@@ -30,6 +30,7 @@
  *   GET  /ws           WebSocket，推送实时日志（二进制帧，UTF-8 文本）
  */
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
@@ -39,6 +40,7 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "repeater.h"
+#include "car_probe.h"
 #include "web_log_priv.h"
 #include "h2_routes.h"
 #include "h2_site.h"
@@ -152,13 +154,14 @@ static esp_err_t status_get(httpd_req_t *req)
 {
     repeater_status_t st;
     repeater_get_status(&st);
-    char buf[320];
+    char buf[352];
     snprintf(buf, sizeof(buf),
              "{\"sta_connected\":%s,\"sta_ip\":\"%s\",\"sta_gw\":\"%s\",\"ap_ip\":\"%s\","
-             "\"rssi\":%d,\"channel\":%u,\"clients\":%d,\"uptime\":%lu,\"free_heap\":%lu}",
+             "\"rssi\":%d,\"channel\":%u,\"clients\":%d,\"uptime\":%lu,\"free_heap\":%lu,\"car_probe\":%s}",
              st.sta_connected ? "true" : "false", st.sta_ip, st.sta_gw, st.ap_ip,
              st.rssi, st.channel, st.clients,
-             (unsigned long)st.uptime_s, (unsigned long)st.free_heap);
+             (unsigned long)st.uptime_s, (unsigned long)st.free_heap,
+             car_probe_enabled() ? "true" : "false");
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, buf);
 }
@@ -872,6 +875,61 @@ static esp_err_t led_post_handler(httpd_req_t *req)
     return led_send_state(req);
 }
 
+/* ---------- 车机联网检测的本机应答（见 car_probe.h） ---------- */
+
+static esp_err_t carprobe_post(httpd_req_t *req)
+{
+    char body[32];
+    if (recv_small_body(req, body, sizeof(body)) < 0) {
+        return send_json_error(req, "400 Bad Request", "请求体为空或过长");
+    }
+    int on;
+    if (form_get_int(body, "enabled", 1, &on) <= 0) {
+        return send_json_error(req, "400 Bad Request", "enabled 须为 0 或 1");
+    }
+    esp_err_t err = car_probe_set(on);
+    if (err != ESP_OK) {
+        return send_json_error(req, "500 Internal Server Error", esp_err_to_name(err));
+    }
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
+/* GET http://connman.vn.cloud.tesla.cn/online/status.html：与真实服务器一致的 46 字节正文 */
+static esp_err_t connman_status_get(httpd_req_t *req)
+{
+    char host[64] = "";
+    httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host));
+    char *colon = strchr(host, ':');
+    if (colon) {
+        *colon = '\0';
+    }
+    if (!car_probe_enabled() || strcasecmp(host, CAR_PROBE_CONNMAN_HOST) != 0) {
+        return httpd_resp_send_404(req);
+    }
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "X-ConnMan-Status", "online");     /* connman 按原样大小写查这个头 */
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    ESP_LOGI(TAG, "联网检测：GET %s%s -> 本机应答 online", host, CAR_PROBE_CONNMAN_PATH);
+    return httpd_resp_sendstr(req, "<html>\n<head>\n</head>\n<body>\n</body>\n</html>\n\n");
+}
+
+/* HEAD http://<www.baidu.cn 的 IP>/：百度实际回 403，照样应答 */
+static esp_err_t root_head(httpd_req_t *req)
+{
+    if (!car_probe_enabled()) {
+        httpd_resp_set_status(req, "405 Method Not Allowed");
+        return httpd_resp_send(req, NULL, 0);
+    }
+    httpd_resp_set_status(req, "403 Forbidden");
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "private, no-cache, no-store, proxy-revalidate, no-transform");
+    httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    httpd_resp_set_hdr(req, "Server", "bfe");
+    ESP_LOGI(TAG, "联网检测：HEAD / -> 本机应答 403（同百度）");
+    return httpd_resp_send(req, NULL, 0);
+}
+
 /* ---------- DNS 黑名单 ---------- */
 
 /* GET：列表；带 ?test=<域名> 时按 DNS 中继的判定顺序给出该域名的处理结果 */
@@ -1023,7 +1081,7 @@ static esp_err_t export_get(httpd_req_t *req)
 esp_err_t web_server_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 30;
+    cfg.max_uri_handlers = 36;
     cfg.lru_purge_enable = true;
     cfg.stack_size = 6144;
 
@@ -1059,6 +1117,9 @@ esp_err_t web_server_start(void)
         { .uri = "/api/mon/bench", .method = HTTP_GET,  .handler = mon_bench_get },
         { .uri = "/api/led",       .method = HTTP_GET,  .handler = led_get_handler },
         { .uri = "/api/led",       .method = HTTP_POST, .handler = led_post_handler },
+        { .uri = "/api/carprobe",  .method = HTTP_POST, .handler = carprobe_post },
+        { .uri = CAR_PROBE_CONNMAN_PATH, .method = HTTP_GET, .handler = connman_status_get },
+        { .uri = "/",              .method = HTTP_HEAD, .handler = root_head },
         { .uri = "/ws",          .method = HTTP_GET,  .handler = ws_handler, .is_websocket = true,
           .ws_post_handshake_cb = ws_post_handshake },
     };

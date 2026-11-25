@@ -20,6 +20,7 @@
 #include "esp_netif.h"
 #include "lwip/sockets.h"
 #include "repeater.h"
+#include "car_probe.h"
 #include "monitor.h"
 #include "dns_filter.h"
 
@@ -427,6 +428,15 @@ static void dns_relay_task(void *arg)
                 int len = build_local_answer(buf, qend, qtype, ip);
                 sendto(lsock, buf, len, 0, (struct sockaddr *)&from, flen);
                 monitor_dns_query(cip, qname, qtype, MON_DNS_LOCAL, ip);
+                continue;
+            }
+
+            /* 配置页域名 esp.lan 与车机联网检测域名：解析到本机的别名地址（见 car_probe.h） */
+            if (qend > 0 && qend + 16 <= (int)sizeof(buf) && car_probe_dns_match(qname)) {
+                uint32_t alias = car_probe_alias_addr();    /* 不能用 AP 地址：车机不连内网地址 */
+                int len = build_local_answer(buf, qend, qtype, alias);
+                sendto(lsock, buf, len, 0, (struct sockaddr *)&from, flen);
+                monitor_dns_query(cip, qname, qtype, MON_DNS_LOCAL, alias);
                 continue;
             }
 

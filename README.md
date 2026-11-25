@@ -30,6 +30,13 @@
 - **板载灯**（WS2812，默认 GPIO48，`CONFIG_REPEATER_LED_GPIO`）：`GET /api/led` 查看；
   `POST /api/led` 带 `on=1|0` 或 `r=&g=&b=`（0-255），可带 `gpio=` 临时切换数据引脚；
   `blink=<秒>` 彩色闪烁（0 停止）。自定义接口命中时自动彩色闪烁 10 秒（闪烁中再次命中重新计时），结束后恢复原来的颜色
+- **车机联网检测的本机应答**（概览页开关，默认开启，存 NVS，见 `main/car_probe.h`）：特斯拉车机连上热点后发
+  `GET http://connman.vn.cloud.tesla.cn/online/status.html` 和 `HEAD http://<www.baidu.cn 的 IP>/`（后者每 10 分钟重复）。
+  开启后这两个域名解析到 `203.0.113.80`（优先于 DNS 黑名单，低于自定义解析；车机不连内网地址，所以本机另挂了这个别名地址，
+  文档保留网段、公网上不存在，本机的 80 / 443 服务在这个地址上同样可达），本机 80 端口回 200 + `X-ConnMan-Status: online`
+  与 403（同百度的真实响应），上游没连上时车机也认为热点能上网。`POST /api/carprobe` 带 `enabled=1|0`，状态在 `/api/status` 的 `car_probe`
+- **车机浏览器打开配置页**：`esp.lan` 始终解析到 `203.0.113.80`（车机浏览器不连内网地址），连上热点后打开 `http://esp.lan/`；
+  自定义解析里有同名条目时以自定义为准
 - **配置备份**：导出 / 导入 YAML（Wi-Fi、DNS 自定义解析、HTTPS 站点、自定义接口）
 - **记录页**（`http://192.168.4.1/monitor`，本次开机内的数据，只存内存）
   - 设备：接入热点的设备、IP、主机名、MAC、实时上下行速率、累计流量、DNS 查询数
@@ -128,6 +135,7 @@ curl --http2 https://www.aabbcc.com/ping
 | GET / POST | `/api/h2routes` | 自定义接口（`action=set&path=&json=` / `action=del&path=`） |
 | GET / POST | `/api/dns` | DNS 自定义解析（`action=set&name=&ip=` / `action=del&name=`） |
 | GET / POST | `/api/h2site` | HTTPS 站点（`action=set&domain=&cert=&key=` / `action=reset`），GET 不返回私钥 |
+| POST | `/api/carprobe` | 车机联网检测的本机应答（`enabled=1|0`） |
 | GET | `/api/export` | 导出全部配置 JSON（含密码与私钥） |
 | GET | `/ws` | 实时日志 WebSocket |
 | GET | `/monitor` | 记录页 |
@@ -147,6 +155,7 @@ main/
   wifi_repeater.c       Wi-Fi APSTA、NAPT、启动流程
   repeater_config.c     Wi-Fi 配置（NVS）
   dns_relay.c           DNS 中继与自定义解析
+  car_probe.c           车机联网检测的本机应答开关
   web_server.c          配置页 HTTP 服务与 API
   web_log.c             日志转发到 WebSocket
   h2_test.c             HTTPS 站点的路由与内置接口

@@ -242,7 +242,13 @@
         <a href="#log"><button type="button">查看日志</button></a>
         <a href="/monitor"><button type="button">记录页</button></a>
       </div>
-      <p class="hint">配置页：<code>http://192.168.4.1/</code>，仅连接本机热点或上游网络的设备可访问。</p>
+      <p class="hint">配置页：<code>http://192.168.4.1/</code> 或 <code>http://esp.lan/</code>（车机浏览器用后者），仅连接本机热点或上游网络的设备可访问。</p>
+    </section>
+    <section class="card">
+      <h3>车机联网检测</h3>
+      <label class="check"><input type="checkbox" id="carProbe">本机应答车机的联网检测</label>
+      <p class="hint">应答 <code>connman.vn.cloud.tesla.cn/online/status.html</code> 与 <code>www.baidu.cn</code> 的 HEAD 请求，上游没连上时车机也认为热点能上网。</p>
+      <div id="cpMsg"></div>
     </section>
     <section class="card">
       <h3>设备</h3>
@@ -448,12 +454,28 @@ async function refreshStatus() {
     $('sCli').textContent = s.clients;
     $('sUp2').textContent = fmtUptime(s.uptime);
     $('sHeap').textContent = (s.free_heap / 1024).toFixed(1) + ' KB';
+    if (!cpBusy) $('carProbe').checked = !!s.car_probe;
   } catch (e) {
     $('upDot').className = 'dot bad';
     $('upText').textContent = '设备无响应';
   }
 }
 setInterval(refreshStatus, 2000);
+let cpBusy = false;
+$('carProbe').onchange = async () => {
+  const on = $('carProbe').checked;
+  cpBusy = true;
+  try {
+    const r = await fetch('/api/carprobe', { method: 'POST', body: new URLSearchParams({ enabled: on ? '1' : '0' }) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) throw new Error(j.error || `请求失败（${r.status}）`);
+    $('cpMsg').textContent = '';
+  } catch (e) {
+    $('carProbe').checked = !on;
+    $('cpMsg').textContent = '保存失败：' + e.message;
+  }
+  cpBusy = false;
+};
 refreshStatus();
 
 /* ---------- 配置 ---------- */

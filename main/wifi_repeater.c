@@ -20,6 +20,7 @@
 #include "esp_system.h"
 #include "nvs_flash.h"
 #include "repeater.h"
+#include "car_probe.h"
 #include "led.h"
 #include "h2_routes.h"
 #include "h2_site.h"
@@ -290,6 +291,7 @@ void app_main(void)
     h2_routes_init();
     dns_relay_load_overrides();
     dns_filter_load();
+    car_probe_load();
     h2_site_load();
 
     ESP_ERROR_CHECK(esp_netif_init());
@@ -318,6 +320,8 @@ void app_main(void)
     /* 出口走 STA；AP 侧开启 NAPT */
     ESP_ERROR_CHECK(esp_netif_set_default_netif(s_netif_sta));
     ESP_ERROR_CHECK(esp_netif_napt_enable(s_netif_ap));
+
+    car_probe_alias_start();      /* 203.0.113.80 别名地址，车机联网检测用（见 car_probe.h） */
 
     /* 客户端 DNS 指向 192.168.4.1（DHCP 默认下发），由中继转发到上游 DNS */
     dns_relay_start(s_netif_ap, s_netif_sta);
