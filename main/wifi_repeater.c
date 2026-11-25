@@ -461,6 +461,9 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
 
     ESP_ERROR_CHECK(esp_wifi_start());
+    /* 关闭 STA 省电：默认的 modem sleep 会让上游把发给本机的包缓存到下一个信标再发，
+     * 转发延迟大、抖动大（实测 ping 本机中位数 54 ms、26% 超过 100 ms，同一热点下网关只有 14 ms） */
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(WIFI_PS_NONE));
 
     /* 出口走 STA；AP 侧开启 NAPT */
     ESP_ERROR_CHECK(esp_netif_set_default_netif(s_netif_sta));
