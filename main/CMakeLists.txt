@@ -47,15 +47,24 @@ endif()
 
 idf_component_register(SRCS "wifi_repeater.c" "repeater_config.c" "web_log.c" "web_server.c"
                             "dns_relay.c" "h2_test.c" "h2_routes.c" "h2_site.c" "monitor.c" "dns_filter.c" "led.c" "car_probe.c"
+                            "napt_lowport.c"
                     PRIV_REQUIRES esp_wifi esp_netif nvs_flash esp_psram esp_http_server esp_timer
                                   esp_ringbuf h2_server mbedtls lwip esp_hw_support
                                   esp_driver_rmt esp_driver_gpio
                     INCLUDE_DIRS "."
                     EMBED_TXTFILES "www/index.html" "www/monitor.html" "${H2_CERT}" "${H2_KEY}")
 
+# 源端口 < 1024 的 UDP 也走 NAPT：包住 lwIP NAPT 的两个入口（见 napt_lowport.c）
+# -u：调用方在 liblwip.a 里，链接时 libmain.a 可能已经扫过，强制把这两个符号拉进来
+target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=ip_napt_forward" "-Wl,--wrap=ip_napt_recv"
+                      "-u __wrap_ip_napt_forward" "-u __wrap_ip_napt_recv")
+
 # 流量记录：把转发钩子注入 lwip 组件（只影响 lwip 自身的编译单元）
 if(NOT CMAKE_BUILD_EARLY_EXPANSION)
     idf_component_get_property(lwip_lib lwip COMPONENT_LIB)
     target_compile_definitions(${lwip_lib} PRIVATE "ESP_IDF_LWIP_HOOK_FILENAME=\"monitor_lwip_hook.h\"")
+    # NAPT 的 UDP 映射空闲超时：lwIP 默认只有 2 秒，UDP 流静默超过 2 秒映射就被回收，
+    # 之后服务器回来的包被丢弃（语音助手等长连接 UDP 会突然收不到回包）。改为 60 秒
+    target_compile_definitions(${lwip_lib} PRIVATE "IP_NAPT_TIMEOUT_MS_UDP=60000")
     target_include_directories(${lwip_lib} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/lwip_hook")
 endif()
