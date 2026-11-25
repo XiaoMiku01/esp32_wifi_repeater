@@ -137,7 +137,7 @@
   #rtList .cnt { font-size:11px; padding:0 6px; border-radius:8px; background:#facc15; color:#111; white-space:nowrap; }
   #rtList .cnt:empty { display:none; }
 
-  /* 应答 JSON 可视化编辑（单层对象，值为布尔或字符串） */
+  /* 应答 JSON 可视化编辑（对象的每个字段一行） */
   .seg { display:inline-flex; border:1px solid var(--line); border-radius:6px; overflow:hidden; margin-bottom:6px; }
   .seg button { border:none; border-radius:0; padding:4px 12px; font-size:12px; }
   .seg button + button { border-left:1px solid var(--line); }
@@ -641,18 +641,19 @@ async function rtPost(fields) {
   try { j = await r.json(); } catch (e) {}
   if (!r.ok || !j.ok) throw new Error(j.error || `请求失败（${r.status}）`);
 }
-/* ---------- 应答 JSON 可视化编辑：单层对象，值为布尔或字符串 ----------
- * 其他结构（嵌套、数字、null、数组等）只能在源码模式编辑 */
+/* ---------- 应答 JSON 可视化编辑：对象的每个字段一行 ----------
+ * 值为布尔或字符串时直接编辑；其他值（数字、null、嵌套对象、数组）以 JSON 文本编辑，类型保持不变。
+ * 顶层不是对象的 JSON 只能在源码模式编辑 */
 let rtMode = 'visual';
-let rtRows = [];                      /* [{k, v}]，v 为 boolean 或 string */
+let rtRows = [];                      /* [{k, v}]，v 为 boolean、string，或 {raw: JSON 文本} */
 
-/* 是否为可视化编辑支持的结构：单层对象，值全为布尔或字符串 */
+/* 顶层是对象才能用可视化编辑 */
 function jlFrom(x) {
   if (!x || typeof x !== 'object' || Array.isArray(x)) return null;
   const rows = [];
   for (const k of Object.keys(x)) {
-    if (typeof x[k] !== 'boolean' && typeof x[k] !== 'string') return null;
-    rows.push({ k, v: x[k] });
+    const v = x[k];
+    rows.push({ k, v: typeof v === 'boolean' || typeof v === 'string' ? v : { raw: JSON.stringify(v) } });
   }
   return rows;
 }
@@ -662,7 +663,12 @@ function jlTo() {
     const k = r.k.trim();
     if (!k) throw new Error('有字段名为空');
     if (Object.prototype.hasOwnProperty.call(o, k)) throw new Error(`字段名“${k}”重复`);
-    o[k] = r.v;
+    if (r.v && typeof r.v === 'object') {
+      try { o[k] = JSON.parse(r.v.raw); }
+      catch (e) { throw new Error(`字段“${k}”的 JSON 值格式错误`); }
+    } else {
+      o[k] = r.v;
+    }
   }
   return o;
 }
@@ -675,21 +681,28 @@ function jlRender() {
     k.type = 'text'; k.className = 'jk'; k.value = r.k; k.placeholder = '字段名';
     k.oninput = () => { r.k = k.value; jlSync(); };
     const v = document.createElement('select');
-    for (const [val, txt] of [['true', 'true'], ['false', 'false'], ['str', '字符串']]) {
+    for (const [val, txt] of [['true', 'true'], ['false', 'false'], ['str', '字符串'], ['json', 'JSON']]) {
       const o = document.createElement('option'); o.value = val; o.textContent = txt; v.appendChild(o);
     }
     const s = document.createElement('input');
-    s.type = 'text'; s.className = 'jv'; s.placeholder = '字符串值';
-    const isStr = typeof r.v === 'string';
-    v.value = isStr ? 'str' : String(r.v);
-    s.value = isStr ? r.v : '';
-    s.hidden = !isStr;
+    s.type = 'text'; s.className = 'jv';
+    const kind = typeof r.v === 'string' ? 'str' : typeof r.v === 'boolean' ? String(r.v) : 'json';
+    const setKind = kd => {
+      s.hidden = kd !== 'str' && kd !== 'json';
+      s.placeholder = kd === 'json' ? 'JSON 值，如 123、null、{"a":1}' : '字符串值';
+    };
+    v.value = kind;
+    s.value = kind === 'str' ? r.v : kind === 'json' ? r.v.raw : '';
+    setKind(kind);
     v.onchange = () => {
-      if (v.value === 'str') { r.v = s.value; s.hidden = false; s.focus(); }
-      else { r.v = v.value === 'true'; s.hidden = true; }
+      if (v.value === 'str') { r.v = s.value; }
+      else if (v.value === 'json') { if (!s.value.trim()) s.value = 'null'; r.v = { raw: s.value }; }
+      else { r.v = v.value === 'true'; }
+      setKind(v.value);
+      if (!s.hidden) s.focus();
       jlSync();
     };
-    s.oninput = () => { r.v = s.value; jlSync(); };
+    s.oninput = () => { r.v = v.value === 'json' ? { raw: s.value } : s.value; jlSync(); };
     const del = document.createElement('button');
     del.type = 'button'; del.textContent = '删除';
     del.onclick = () => { rtRows.splice(i, 1); jlRender(); jlSync(); };
@@ -721,7 +734,7 @@ function rtSetMode(m) {
     let rows;
     try { rows = text ? jlFrom(JSON.parse(text)) : []; }
     catch (e) { rtShowMsg('JSON 格式错误：' + e.message, false); return false; }
-    if (!rows) { rtShowMsg('可视化只支持单层对象、值为 true/false 或字符串，当前 JSON 请在源码模式编辑', false); return false; }
+    if (!rows) { rtShowMsg('可视化只支持顶层为对象的 JSON，当前 JSON 请在源码模式编辑', false); return false; }
     rtRows = rows;
     jlRender();
   }
@@ -739,7 +752,7 @@ function rtShowMode(m) {
   for (const b of $('rtMode').children) b.classList.toggle('on', b.dataset.m === m);
 }
 $('rtMode').onclick = ev => { const m = ev.target.dataset && ev.target.dataset.m; if (m) rtSetMode(m); };
-/* 载入一段 JSON 文本（编辑、清空时用）：可视化支持的结构用列表编辑，否则切到源码 */
+/* 载入一段 JSON 文本（编辑、清空时用）：顶层是对象用列表编辑，否则切到源码 */
 function rtLoadJson(text) {
   try { $('rtJson').value = text ? JSON.stringify(JSON.parse(text), null, 2) : ''; } catch (e) { $('rtJson').value = text; }
   let rows = null;
@@ -749,7 +762,7 @@ function rtLoadJson(text) {
     rtShowMode('visual');
     jlRender(); jlSync();
   } else {
-    rtShowMode('source');          /* 嵌套或其他类型的值：源码编辑，内容保持原样 */
+    rtShowMode('source');          /* 顶层不是对象或解析失败：源码编辑，内容保持原样 */
   }
   rtUpdateSize();
 }
