@@ -1,0 +1,6 @@
+# 单应用分区 1.5MB（偏移与 IDF 自带的 partitions_singleapp_large.csv 相同），NVS 扩到 256KB 并移到应用分区之后
+# 末尾 0x1C7000，4MB flash 也放得下
+# Name,   Type, SubType, Offset,   Size
+phy_init, data, phy,     0xf000,   0x1000,
+factory,  app,  factory, 0x10000,  0x177000,
+nvs,      data, nvs,     0x187000, 0x40000,
