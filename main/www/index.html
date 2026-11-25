@@ -22,6 +22,8 @@
   header.top { position:sticky; top:0; z-index:20; height:var(--hdr); padding:0 16px; display:flex; align-items:center; gap:10px;
                background:var(--card); border-bottom:1px solid var(--line); }
   header.top h1 { font-size:16px; margin:0; white-space:nowrap; }
+  .hdr-time { font:12px/1 ui-monospace,Menlo,Consolas,monospace; color:var(--muted); white-space:nowrap; }
+  .hdr-time #hdrDate { margin-right:6px; }
   .pill { display:inline-flex; align-items:center; gap:6px; padding:2px 10px; border-radius:999px; border:1px solid var(--line);
           font-size:12px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
   .spacer { flex:1; }
@@ -210,6 +212,7 @@
   <h1>ESP32 Wi-Fi 中继</h1>
   <span class="pill"><span class="dot" id="upDot"></span><span id="upText">读取中…</span></span>
   <span class="spacer"></span>
+  <span class="hdr-time" id="hdrTime" title="设备时间（SNTP 对时）"><span class="hide-sm" id="hdrDate"></span><span id="hdrClock">时间未同步</span></span>
   <span class="pill hide-sm">日志 <span class="dot" id="wsDot"></span></span>
 </header>
 
@@ -237,7 +240,6 @@
         <div class="tile"><div class="k">客户端</div><div class="v" id="sCli">-</div></div>
         <div class="tile"><div class="k">运行时间</div><div class="v" id="sUp2">-</div></div>
         <div class="tile"><div class="k">空闲内存</div><div class="v" id="sHeap">-</div></div>
-        <div class="tile"><div class="k">设备时间</div><div class="v" id="sTime">-</div></div>
       </div>
     </section>
     <div class="stack">
@@ -482,13 +484,23 @@ async function refreshStatus() {
     $('sCli').textContent = s.clients;
     $('sUp2').textContent = fmtUptime(s.uptime);
     $('sHeap').textContent = (s.free_heap / 1024).toFixed(1) + ' KB';
-    $('sTime').textContent = s.time ? new Date(s.time * 1000).toLocaleString('zh-CN', { hour12: false }) : '未同步';
+    devTimeOff = s.time ? s.time * 1000 - Date.now() : null;
+    showDevTime();
     if (!cpBusy) $('carProbe').checked = !!s.car_probe;
   } catch (e) {
     $('upDot').className = 'dot bad';
     $('upText').textContent = '设备无响应';
   }
 }
+/* 页眉的设备时间：状态接口每 2 秒给一次设备时间，中间按浏览器时钟每秒走字 */
+let devTimeOff = null;      /* 设备时间 - 浏览器时间（毫秒）；null = 设备还没对时 */
+function showDevTime() {
+  if (devTimeOff === null) { $('hdrDate').textContent = ''; $('hdrClock').textContent = '时间未同步'; return; }
+  const t = new Date(Date.now() + devTimeOff), p2 = n => String(n).padStart(2, '0');
+  $('hdrDate').textContent = `${t.getFullYear()}-${p2(t.getMonth() + 1)}-${p2(t.getDate())}`;
+  $('hdrClock').textContent = `${p2(t.getHours())}:${p2(t.getMinutes())}:${p2(t.getSeconds())}`;
+}
+setInterval(showDevTime, 1000);
 setInterval(refreshStatus, 2000);
 let cpBusy = false;
 $('carProbe').onchange = async () => {
