@@ -53,7 +53,7 @@
 
 | 芯片 | 默认配置 | 流量记录 |
 |---|---|---|
-| ESP32-S3 | 8 MB flash（DIO）、2 MB quad PSRAM、240 MHz（开发与测试用的板子） | 默认开启，记录表放 PSRAM |
+| ESP32-S3 | 8 MB flash（DIO）、2 MB quad PSRAM、240 MHz（开发与测试用的板子） | 默认关闭，可在记录页开启；记录表放 PSRAM |
 | ESP32-S3 N16R8 | 叠加 `sdkconfig.defaults.n16r8`：16 MB flash、8 MB octal PSRAM | 同上 |
 | ESP32-C3 / C6 | 4 MB flash（DIO）、无 PSRAM、160 MHz、TLS 缓冲按需分配 | 默认关闭，可在记录页开启；记录表放内部 RAM（约 52KB），容量较小（连接 64 条、DNS 记录 128 条） |
 

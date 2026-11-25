@@ -28,12 +28,11 @@ menu "Wi-Fi Repeater"
 
     config REPEATER_MONITOR_DEFAULT_ON
         bool "开机默认开启流量记录与拦截"
-        default y if SPIRAM
         default n
         help
-            关闭时开机不分配记录表（客户端、连接、DNS 记录），转发钩子直接放行，
-            省内存和 CPU；可在记录页随时开启（首次开启时分配）。
+            默认关闭：开机不分配记录表（客户端、连接、DNS 记录），转发钩子直接放行，
+            省内存和 CPU；需要时在记录页勾选「记录与拦截」开启（首次开启时分配），重启后恢复关闭。
             DNS 黑名单与记录页的域名黑名单（DNS 层面）不受影响。
-            没有 PSRAM 的芯片（如 ESP32-C3/C6）默认关闭，记录表也按较小容量分配。
+            没有 PSRAM 的芯片（如 ESP32-C3/C6）记录表按较小容量分配。
 
 endmenu
