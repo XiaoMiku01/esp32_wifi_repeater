@@ -41,6 +41,7 @@
 #include "esp_system.h"
 #include "repeater.h"
 #include "car_probe.h"
+#include "h2_pass.h"
 #include "web_log_priv.h"
 #include "h2_routes.h"
 #include "h2_site.h"
@@ -154,14 +155,16 @@ static esp_err_t status_get(httpd_req_t *req)
 {
     repeater_status_t st;
     repeater_get_status(&st);
-    char buf[352];
+    char buf[384];
     snprintf(buf, sizeof(buf),
              "{\"sta_connected\":%s,\"sta_ip\":\"%s\",\"sta_gw\":\"%s\",\"ap_ip\":\"%s\","
-             "\"rssi\":%d,\"channel\":%u,\"clients\":%d,\"uptime\":%lu,\"free_heap\":%lu,\"car_probe\":%s}",
+             "\"rssi\":%d,\"channel\":%u,\"clients\":%d,\"uptime\":%lu,\"free_heap\":%lu,\"car_probe\":%s,"
+             "\"time\":%lu}",
              st.sta_connected ? "true" : "false", st.sta_ip, st.sta_gw, st.ap_ip,
              st.rssi, st.channel, st.clients,
              (unsigned long)st.uptime_s, (unsigned long)st.free_heap,
-             car_probe_enabled() ? "true" : "false");
+             car_probe_enabled() ? "true" : "false",
+             (unsigned long)repeater_time_now());
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, buf);
 }
@@ -875,6 +878,49 @@ static esp_err_t led_post_handler(httpd_req_t *req)
     return led_send_state(req);
 }
 
+/* ---------- HTTPS 站点的临时 TLS 透传（见 h2_pass.h） ---------- */
+
+static esp_err_t h2pass_get(httpd_req_t *req)
+{
+    h2_pass_info_t i;
+    h2_pass_get(&i);
+    char buf[320];
+    snprintf(buf, sizeof(buf),
+             "{\"enabled\":%s,\"secs\":%u,\"max_secs\":%d,\"active\":%s,\"conns\":%u,"
+             "\"triggers\":%lu,\"relayed\":%lu,\"trigger\":\"%s*%s\","
+             "\"fc_hits\":%lu,\"fc_ago\":%ld}",
+             i.enabled ? "true" : "false", (unsigned)i.secs, H2_PASS_SECS_MAX, i.active ? "true" : "false",
+             (unsigned)i.conns, (unsigned long)i.triggers, (unsigned long)i.relayed,
+             H2_PASS_TRIGGER_PREFIX, H2_PASS_TRIGGER_SUFFIX,
+             (unsigned long)i.fc_hits, (long)i.fc_ago_s);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_sendstr(req, buf);
+}
+
+/* POST enabled=1|0&secs=<1..60>，两项都可省略（省略的保持不变） */
+static esp_err_t h2pass_post(httpd_req_t *req)
+{
+    char body[48];
+    if (recv_small_body(req, body, sizeof(body)) < 0) {
+        return send_json_error(req, "400 Bad Request", "请求体为空或过长");
+    }
+    h2_pass_info_t i;
+    h2_pass_get(&i);
+    int on = i.enabled, secs = i.secs;
+    if (form_get_int(body, "enabled", 1, &on) < 0) {
+        return send_json_error(req, "400 Bad Request", "enabled 须为 0 或 1");
+    }
+    if (form_get_int(body, "secs", H2_PASS_SECS_MAX, &secs) < 0 || secs < 1) {
+        return send_json_error(req, "400 Bad Request", "secs 须为 1-60");
+    }
+    esp_err_t err = h2_pass_set(on, secs);
+    if (err != ESP_OK) {
+        return send_json_error(req, "500 Internal Server Error", esp_err_to_name(err));
+    }
+    return h2pass_get(req);
+}
+
 /* ---------- 车机联网检测的本机应答（见 car_probe.h） ---------- */
 
 static esp_err_t carprobe_post(httpd_req_t *req)
@@ -1096,7 +1142,7 @@ static esp_err_t export_get(httpd_req_t *req)
 esp_err_t web_server_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 36;
+    cfg.max_uri_handlers = 40;
     cfg.lru_purge_enable = true;
     cfg.stack_size = 6144;
 
@@ -1120,6 +1166,8 @@ esp_err_t web_server_start(void)
         { .uri = "/api/dns",      .method = HTTP_POST, .handler = dns_post },
         { .uri = "/api/h2site",   .method = HTTP_GET,  .handler = h2site_get },
         { .uri = "/api/h2site",   .method = HTTP_POST, .handler = h2site_post },
+        { .uri = "/api/h2pass",   .method = HTTP_GET,  .handler = h2pass_get },
+        { .uri = "/api/h2pass",   .method = HTTP_POST, .handler = h2pass_post },
         { .uri = "/api/export",   .method = HTTP_GET,  .handler = export_get },
         { .uri = "/api/dnsblock", .method = HTTP_GET,  .handler = dnsblock_get },
         { .uri = "/api/dnsblock", .method = HTTP_POST, .handler = dnsblock_post },

@@ -19,6 +19,7 @@
 #include "repeater.h"
 #include "h2_routes.h"
 #include "h2_site.h"
+#include "h2_pass.h"
 #include "led.h"
 
 #define LED_HIT_BLINK_MS 10000   /* 自定义接口命中后板载灯闪烁时长 */
@@ -112,6 +113,7 @@ static void send_custom_json(const char *matched, const char *json, const char *
     ESP_LOGI(TAG, "HIT path=%s method=%s proto=%s peer=%s req=%s", matched, h2_req_method(req),
              h2_req_proto(req), h2_req_peer(req), h2_req_path(req));
     led_blink(LED_HIT_BLINK_MS);
+    h2_pass_note_hit(h2_req_path(req));
     h2_resp_add_header(req, "x-checksum", md5);
     h2_resp_add_header(req, "cache-control", "no-store");
     h2_resp_sendstr(req, 200, "application/json", json);
@@ -121,6 +123,9 @@ static void send_custom_json(const char *matched, const char *json, const char *
 static esp_err_t custom_handler(h2_req_t *req)
 {
     if (h2_routes_with(h2_req_path(req), send_custom_json, req)) {
+        return ESP_OK;
+    }
+    if (h2_pass_try_trigger(req)) {     /* 命中透传触发路径：不应答，关连接，之后几秒的新连接透传 */
         return ESP_OK;
     }
     return h2_resp_sendstr(req, 404, "text/plain", "not found\n");
@@ -139,6 +144,7 @@ esp_err_t h2_test_start(void)
         return err;
     }
     h2_site_set_server(srv);
+    h2_pass_attach(srv);
     char domain[64];
     h2_site_get_domain(domain, sizeof(domain));
     ESP_LOGI(TAG, "HTTP/2 站点 https://%s/ （端口 %d）", domain, H2_SITE_PORT);

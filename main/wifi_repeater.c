@@ -17,10 +17,15 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
+#include <time.h>
+#include <sys/time.h>
+#include "esp_netif_sntp.h"
+#include "esp_sntp.h"
 #include "esp_system.h"
 #include "nvs_flash.h"
 #include "repeater.h"
 #include "car_probe.h"
+#include "h2_pass.h"
 #include "led.h"
 #include "h2_routes.h"
 #include "h2_site.h"
@@ -74,6 +79,37 @@ static void fill_wifi_configs(const repeater_cfg_t *c, wifi_config_t *ap, wifi_c
     sta->sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
     sta->sta.threshold.authmode = c->sta_pass[0] ? WIFI_AUTH_WPA_PSK : WIFI_AUTH_OPEN;
     sta->sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+}
+
+/* ---------- SNTP 对时 ---------- */
+
+/* 时间早于这个值（2023-11）视为还没同步 */
+#define TIME_VALID_EPOCH    1700000000
+
+static void time_sync_cb(struct timeval *tv)
+{
+    struct tm tm;
+    char buf[32];
+    localtime_r(&tv->tv_sec, &tm);
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+    ESP_LOGI(TAG, "SNTP 对时完成：%s（北京时间）", buf);
+}
+
+/* 上游连上后才能对时；这里先启动，没连上时 lwIP 会自己重试 */
+static void time_sync_start(void)
+{
+    setenv("TZ", "CST-8", 1);       /* 日志和页面按北京时间显示 */
+    tzset();
+    esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE(3,
+            ESP_SNTP_SERVER_LIST("ntp.aliyun.com", "ntp.tencent.com", "cn.pool.ntp.org"));
+    cfg.sync_cb = time_sync_cb;
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_sntp_init(&cfg));
+}
+
+uint32_t repeater_time_now(void)
+{
+    time_t t = time(NULL);
+    return t >= TIME_VALID_EPOCH ? (uint32_t)t : 0;
 }
 
 static void upstream_kick(void)
@@ -244,6 +280,7 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
             s_sta_connected = true;
             s_connecting = false;
             s_conn_fails = 0;
+            esp_sntp_restart();     /* 上游刚连上：立即对时，不等 lwIP 的重试间隔 */
             ESP_LOGI(TAG, "上游已连接，STA IP: " IPSTR " GW: " IPSTR,
                      IP2STR(&e->ip_info.ip), IP2STR(&e->ip_info.gw));
         } else if (id == IP_EVENT_ASSIGNED_IP_TO_CLIENT) {
@@ -437,6 +474,7 @@ void app_main(void)
     dns_relay_load_overrides();
     dns_filter_load();
     car_probe_load();
+    h2_pass_load();
     h2_site_load();
 
     ESP_ERROR_CHECK(esp_netif_init());
@@ -469,6 +507,7 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_netif_set_default_netif(s_netif_sta));
     ESP_ERROR_CHECK(esp_netif_napt_enable(s_netif_ap));
 
+    time_sync_start();
     car_probe_alias_start();      /* 203.0.113.80 别名地址，车机联网检测用（见 car_probe.h） */
 
     /* 客户端 DNS 指向 192.168.4.1（DHCP 默认下发），由中继转发到上游 DNS */

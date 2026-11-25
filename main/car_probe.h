@@ -1,5 +1,5 @@
 /*
- * 特斯拉车机联网检测的本机应答（概览页开关，默认开启，存 NVS）
+ * 特斯拉车机联网检测的本机应答（概览页「车机专用功能」里的开关，默认开启，存 NVS）
  *
  * 车机连上热点后用两个明文 HTTP 请求判断能否上网：
  *   GET  http://connman.vn.cloud.tesla.cn/online/status.html   期望 200 且带 X-ConnMan-Status: online

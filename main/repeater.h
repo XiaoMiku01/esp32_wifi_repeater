@@ -43,6 +43,8 @@ void repeater_get_cfg(repeater_cfg_t *out);
 /* 校验并保存到 NVS，随后异步应用到 Wi-Fi（AP 客户端会被断开重连） */
 esp_err_t repeater_set_cfg(const repeater_cfg_t *cfg, const char **err_msg);
 void repeater_get_status(repeater_status_t *st);
+/* 当前时间（Unix 秒）；SNTP 还没同步时返回 0 */
+uint32_t repeater_time_now(void);
 /* 阻塞扫描周边网络，按信号强度降序、同名去重；返回条数，失败返回 -1 */
 int repeater_scan(repeater_scan_item_t *out, int max);
 
