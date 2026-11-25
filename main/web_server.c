@@ -895,7 +895,16 @@ static esp_err_t carprobe_post(httpd_req_t *req)
     return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
-/* GET http://connman.vn.cloud.tesla.cn/online/status.html：与真实服务器一致的 46 字节正文 */
+/* 探测应答发完即关连接：connman 的 HTTP 客户端在请求里带 Connection: close，等服务器关闭连接才算应答结束；
+ * esp_http_server 不理会这个头、连接一直留着，车机等到超时就判定检测失败并断开热点（实测接入约 27 秒后）。
+ * 须在 httpd_resp_send* 之前调用（要加响应头），关闭动作排在本次应答发完之后 */
+static void probe_close_after_resp(httpd_req_t *req)
+{
+    httpd_resp_set_hdr(req, "Connection", "close");
+    httpd_sess_trigger_close(req->handle, httpd_req_to_sockfd(req));
+}
+
+/* GET / HEAD http://connman.vn.cloud.tesla.cn/online/status.html：与真实服务器一致的 46 字节正文 */
 static esp_err_t connman_status_get(httpd_req_t *req)
 {
     char host[64] = "";
@@ -910,7 +919,12 @@ static esp_err_t connman_status_get(httpd_req_t *req)
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "X-ConnMan-Status", "online");     /* connman 按原样大小写查这个头 */
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    ESP_LOGI(TAG, "联网检测：GET %s%s -> 本机应答 online", host, CAR_PROBE_CONNMAN_PATH);
+    probe_close_after_resp(req);
+    bool head = req->method == HTTP_HEAD;
+    ESP_LOGI(TAG, "联网检测：%s %s%s -> 本机应答 online", head ? "HEAD" : "GET", host, CAR_PROBE_CONNMAN_PATH);
+    if (head) {
+        return httpd_resp_send(req, NULL, 0);
+    }
     return httpd_resp_sendstr(req, "<html>\n<head>\n</head>\n<body>\n</body>\n</html>\n\n");
 }
 
@@ -926,6 +940,7 @@ static esp_err_t root_head(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Cache-Control", "private, no-cache, no-store, proxy-revalidate, no-transform");
     httpd_resp_set_hdr(req, "Pragma", "no-cache");
     httpd_resp_set_hdr(req, "Server", "bfe");
+    probe_close_after_resp(req);
     ESP_LOGI(TAG, "联网检测：HEAD / -> 本机应答 403（同百度）");
     return httpd_resp_send(req, NULL, 0);
 }
@@ -1119,6 +1134,7 @@ esp_err_t web_server_start(void)
         { .uri = "/api/led",       .method = HTTP_POST, .handler = led_post_handler },
         { .uri = "/api/carprobe",  .method = HTTP_POST, .handler = carprobe_post },
         { .uri = CAR_PROBE_CONNMAN_PATH, .method = HTTP_GET, .handler = connman_status_get },
+        { .uri = CAR_PROBE_CONNMAN_PATH, .method = HTTP_HEAD, .handler = connman_status_get },
         { .uri = "/",              .method = HTTP_HEAD, .handler = root_head },
         { .uri = "/ws",          .method = HTTP_GET,  .handler = ws_handler, .is_websocket = true,
           .ws_post_handshake_cb = ws_post_handshake },
