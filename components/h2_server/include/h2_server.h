@@ -79,6 +79,11 @@ esp_err_t h2_server_register(h2_server_handle_t srv, const h2_route_t *route);
  * 调用方应先校验证书与私钥配对，否则新连接握手会失败 */
 esp_err_t h2_server_set_cert(h2_server_handle_t srv, const uint8_t *cert_pem, size_t cert_len,
                              const uint8_t *key_pem, size_t key_len);
+/* 新连接钩子：accept 之后、TLS 握手之前调用（在 accept 任务里，须尽快返回）。
+ * 返回 true 表示 fd 已被接管（由钩子负责关闭），本服务不再处理这条连接；返回 false 照常握手。
+ * 用于把连接原样转发到别处（TLS 透传） */
+typedef bool (*h2_accept_hook_t)(int fd, const char *peer, void *arg);
+void h2_server_set_accept_hook(h2_server_handle_t srv, h2_accept_hook_t hook, void *arg);
 /* 停止接受新连接；已有连接在当前请求处理完或空闲超时后退出 */
 void h2_server_stop(h2_server_handle_t srv);
 
@@ -108,6 +113,10 @@ esp_err_t h2_resp_add_header(h2_req_t *req, const char *name, const char *value)
 /* 发送响应，body 会被复制；content_type 可为 NULL */
 esp_err_t h2_resp_send(h2_req_t *req, int status, const char *content_type,
                        const void *body, size_t len);
+/* 不应答这个请求并关闭连接，让客户端在新连接上重试：
+ * HTTP/2 发 RST_STREAM(REFUSED_STREAM) + GOAWAY（last-stream-id 小于本请求，表示未处理、可安全重试）；
+ * HTTP/1.1 直接关闭。调用后不要再调 h2_resp_send */
+void h2_req_refuse(h2_req_t *req);
 static inline esp_err_t h2_resp_sendstr(h2_req_t *req, int status, const char *content_type,
                                         const char *str)
 {

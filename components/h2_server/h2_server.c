@@ -55,6 +55,8 @@ struct h2_server {
     SemaphoreHandle_t lock;         /* 保护路由表和证书 */
     h2_route_t *routes;
     uint8_t n_routes;
+    h2_accept_hook_t accept_hook;
+    void *accept_hook_arg;
 };
 
 typedef struct {
@@ -63,6 +65,7 @@ typedef struct {
     int fd;
     nghttp2_session *ng;
     char peer[16];
+    bool refuse_close;      /* h2_req_refuse()：把已排队的帧发出去后关闭连接 */
 } h2_conn_t;
 
 struct h2_req {
@@ -422,6 +425,24 @@ esp_err_t h2_resp_send(h2_req_t *req, int status, const char *content_type,
 
 /* ---------- 分发 ---------- */
 
+void h2_req_refuse(h2_req_t *req)
+{
+    if (!req || req->responded) {
+        return;
+    }
+    req->responded = true;
+    h2_conn_t *c = req->conn;
+    c->refuse_close = true;
+    if (req->http1) {
+        req->http1_close = true;
+        req->write_failed = true;       /* 让 HTTP/1.1 循环不写应答、直接结束 */
+        return;
+    }
+    nghttp2_submit_rst_stream(c->ng, NGHTTP2_FLAG_NONE, req->stream_id, NGHTTP2_REFUSED_STREAM);
+    int32_t last = req->stream_id >= 2 ? req->stream_id - 2 : 0;
+    nghttp2_submit_goaway(c->ng, NGHTTP2_FLAG_NONE, last, NGHTTP2_NO_ERROR, NULL, 0);
+}
+
 static void dispatch(h2_conn_t *c, h2_req_t *req)
 {
     req->dispatched = true;
@@ -631,6 +652,9 @@ static void serve_h2(h2_conn_t *c)
         if ((rv = nghttp2_session_send(c->ng)) != 0) {
             ESP_LOGD(TAG, "session_send: %s", nghttp2_strerror(rv));
             break;
+        }
+        if (c->refuse_close) {
+            break;      /* RST_STREAM + GOAWAY 已发出，关闭连接让客户端重连 */
         }
         if (!nghttp2_session_want_read(c->ng)) {
             continue;
@@ -1017,6 +1041,13 @@ static void accept_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
+        if (srv->accept_hook) {
+            char hip[16];
+            inet_ntoa_r(peer.sin_addr, hip, sizeof(hip));
+            if (srv->accept_hook(fd, hip, srv->accept_hook_arg)) {
+                continue;       /* fd 已被接管 */
+            }
+        }
         if (xSemaphoreTake(srv->conn_sem, 0) != pdTRUE) {
             char ip[16];
             inet_ntoa_r(peer.sin_addr, ip, sizeof(ip));
@@ -1157,6 +1188,14 @@ esp_err_t h2_server_register(h2_server_handle_t srv, const h2_route_t *route)
     }
     xSemaphoreGive(srv->lock);
     return err;
+}
+
+void h2_server_set_accept_hook(h2_server_handle_t srv, h2_accept_hook_t hook, void *arg)
+{
+    if (srv) {
+        srv->accept_hook_arg = arg;
+        srv->accept_hook = hook;
+    }
 }
 
 void h2_server_stop(h2_server_handle_t srv)
