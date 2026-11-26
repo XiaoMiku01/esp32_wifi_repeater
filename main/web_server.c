@@ -884,18 +884,36 @@ static esp_err_t h2pass_get(httpd_req_t *req)
 {
     h2_pass_info_t i;
     h2_pass_get(&i);
-    char buf[320];
-    snprintf(buf, sizeof(buf),
+    /* 请求体可能是二进制，按 hex 输出，由页面解码显示 */
+    uint8_t *body = malloc(H2_PASS_FC_BODY_MAX);
+    char *buf = malloc(384 + 2 * H2_PASS_FC_BODY_MAX);
+    if (!body || !buf) {
+        free(body);
+        free(buf);
+        return send_json_error(req, "500 Internal Server Error", "no memory");
+    }
+    uint32_t total = 0;
+    size_t n = h2_pass_fc_body(body, H2_PASS_FC_BODY_MAX, &total);
+    int off = snprintf(buf, 384,
              "{\"enabled\":%s,\"secs\":%u,\"max_secs\":%d,\"active\":%s,\"conns\":%u,"
              "\"triggers\":%lu,\"relayed\":%lu,\"trigger\":\"%s*%s\","
-             "\"fc_hits\":%lu,\"fc_ago\":%ld}",
+             "\"fc_hits\":%lu,\"fc_ago\":%ld,\"fc_body_len\":%lu,\"fc_body\":\"",
              i.enabled ? "true" : "false", (unsigned)i.secs, H2_PASS_SECS_MAX, i.active ? "true" : "false",
              (unsigned)i.conns, (unsigned long)i.triggers, (unsigned long)i.relayed,
              H2_PASS_TRIGGER_PREFIX, H2_PASS_TRIGGER_SUFFIX,
-             (unsigned long)i.fc_hits, (long)i.fc_ago_s);
+             (unsigned long)i.fc_hits, (long)i.fc_ago_s, (unsigned long)total);
+    static const char hex[] = "0123456789abcdef";
+    for (size_t k = 0; k < n; k++) {
+        buf[off++] = hex[body[k] >> 4];
+        buf[off++] = hex[body[k] & 15];
+    }
+    strcpy(buf + off, "\"}");
+    free(body);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    return httpd_resp_sendstr(req, buf);
+    esp_err_t err = httpd_resp_sendstr(req, buf);
+    free(buf);
+    return err;
 }
 
 /* POST enabled=1|0&secs=<1..60>，两项都可省略（省略的保持不变） */

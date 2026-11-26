@@ -113,7 +113,7 @@ static void send_custom_json(const char *matched, const char *json, const char *
     ESP_LOGI(TAG, "HIT path=%s method=%s proto=%s peer=%s req=%s", matched, h2_req_method(req),
              h2_req_proto(req), h2_req_peer(req), h2_req_path(req));
     led_blink(LED_HIT_BLINK_MS);
-    h2_pass_note_hit(h2_req_path(req));
+    h2_pass_note_hit(req);
     h2_resp_add_header(req, "x-checksum", md5);
     h2_resp_add_header(req, "cache-control", "no-store");
     h2_resp_sendstr(req, 200, "application/json", json);

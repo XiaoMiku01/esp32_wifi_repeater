@@ -282,6 +282,7 @@
       <h4 class="sub">feature_configuration</h4>
       <div class="stat">
         <span>上次命中</span><span id="fcLast">-</span>
+        <span>上次请求体</span><pre id="fcBody" style="margin:0; max-height:240px; overflow:auto; white-space:pre-wrap; word-break:break-all; font:12px/1.5 ui-monospace,Menlo,Consolas,monospace">-</pre>
         <span>本次开机</span><span id="fcCnt">-</span>
       </div>
     </section>
@@ -900,6 +901,24 @@ function passShow(i) {
     $('fcLast').textContent = `${ago}（${sameDay ? '' : `${t.getMonth() + 1}-${p2(t.getDate())} `}${p2(t.getHours())}:${p2(t.getMinutes())}:${p2(t.getSeconds())}）`;
   }
   $('fcCnt').textContent = `命中 ${i.fc_hits} 次`;
+  $('fcBody').textContent = fcBodyText(i);
+}
+/* 请求体按 hex 传来：能按 UTF-8 解码就显示文本（JSON 则格式化），否则显示 hex */
+function fcBodyText(i) {
+  if (i.fc_ago < 0) return '-';
+  if (!i.fc_body_len) return '（空）';
+  const hex = i.fc_body || '', bytes = new Uint8Array(hex.length / 2);
+  for (let k = 0; k < bytes.length; k++) bytes[k] = parseInt(hex.substr(k * 2, 2), 16);
+  const cut = i.fc_body_len > bytes.length ? `\n…（共 ${i.fc_body_len} 字节，只显示前 ${bytes.length} 字节）` : '';
+  const dec = new TextDecoder('utf-8', { fatal: true });
+  let text = null;
+  /* 截断处可能切开一个多字节字符，最多去掉末尾 3 字节再试 */
+  for (let n = bytes.length; text === null && n >= Math.max(0, bytes.length - (cut ? 3 : 0)); n--) {
+    try { text = dec.decode(bytes.subarray(0, n)); } catch (_) {}
+  }
+  if (text === null) return `二进制 ${i.fc_body_len} 字节：\n` + hex.replace(/(..)/g, '$1 ').trim() + cut;
+  if (!cut) { try { text = JSON.stringify(JSON.parse(text), null, 2); } catch (_) {} }
+  return text + cut;
 }
 async function passLoad() { passShow(await (await fetch('/api/h2pass', { cache: 'no-store' })).json()); }
 $('passOn').onchange = $('passSecs').oninput = () => { passDirty = true; };

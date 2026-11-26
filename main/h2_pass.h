@@ -40,6 +40,9 @@ void h2_pass_get(h2_pass_info_t *out);
 esp_err_t h2_pass_set(bool enabled, int secs);  /* 立即生效并写入 NVS */
 /* 请求未命中自定义接口时调用：命中触发路径且功能开启则开始透传窗口并拒绝该请求，返回 true */
 bool h2_pass_try_trigger(h2_req_t *req);
-/* 自定义接口命中时调用：请求路径含 H2_PASS_FEATURE_CFG 时记下命中时刻（只存内存），供概览页显示 */
+/* 自定义接口命中时调用：请求路径含 H2_PASS_FEATURE_CFG 时记下命中时刻和请求体（只存内存），供概览页显示 */
 #define H2_PASS_FEATURE_CFG     "feature_configuration"
-void h2_pass_note_hit(const char *req_path);
+#define H2_PASS_FC_BODY_MAX     1024    /* 请求体最多保存这么多字节，超出部分截断 */
+void h2_pass_note_hit(h2_req_t *req);
+/* 复制上次命中的请求体（最多 cap 字节），返回复制的字节数；*total 为原始长度（可能大于返回值） */
+size_t h2_pass_fc_body(uint8_t *buf, size_t cap, uint32_t *total);

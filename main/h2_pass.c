@@ -29,6 +29,9 @@ static volatile uint8_t s_conns;
 static volatile uint32_t s_triggers, s_relayed;
 static volatile uint32_t s_fc_hits;
 static volatile int64_t s_fc_last_us;   /* 上次命中 feature_configuration 的时刻，0 = 还没命中过 */
+static uint8_t s_fc_body[H2_PASS_FC_BODY_MAX];  /* 上次命中的请求体（截断），受 s_mux 保护 */
+static size_t s_fc_body_len;
+static uint32_t s_fc_body_total;
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 
 typedef struct {
@@ -70,15 +73,33 @@ void h2_pass_get(h2_pass_info_t *out)
     out->fc_ago_s = last ? (int32_t)((esp_timer_get_time() - last) / 1000000) : -1;
 }
 
-void h2_pass_note_hit(const char *req_path)
+void h2_pass_note_hit(h2_req_t *req)
 {
-    for (const char *p = req_path; *p; p++) {
+    for (const char *p = h2_req_path(req); *p; p++) {
         if (strncasecmp(p, H2_PASS_FEATURE_CFG, strlen(H2_PASS_FEATURE_CFG)) == 0) {
+            size_t len = 0;
+            const uint8_t *body = h2_req_body(req, &len);
+            size_t n = body ? (len < sizeof(s_fc_body) ? len : sizeof(s_fc_body)) : 0;
+            taskENTER_CRITICAL(&s_mux);
+            if (n) memcpy(s_fc_body, body, n);
+            s_fc_body_len = n;
+            s_fc_body_total = body ? (uint32_t)len : 0;
             s_fc_last_us = esp_timer_get_time();
             s_fc_hits++;
+            taskEXIT_CRITICAL(&s_mux);
             return;
         }
     }
+}
+
+size_t h2_pass_fc_body(uint8_t *buf, size_t cap, uint32_t *total)
+{
+    taskENTER_CRITICAL(&s_mux);
+    size_t n = s_fc_body_len < cap ? s_fc_body_len : cap;
+    memcpy(buf, s_fc_body, n);
+    *total = s_fc_body_total;
+    taskEXIT_CRITICAL(&s_mux);
+    return n;
 }
 
 esp_err_t h2_pass_set(bool enabled, int secs)
